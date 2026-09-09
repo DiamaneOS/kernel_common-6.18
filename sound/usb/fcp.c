@@ -492,7 +492,7 @@ static int fcp_ioctl_init(struct usb_mixer_interface *mixer,
 	/* Allocate response buffer */
 	buf_size = init.step0_resp_size + init.step2_resp_size;
 
-	resp = kmalloc(buf_size, GFP_KERNEL);
+	resp = kzalloc(buf_size, GFP_KERNEL);
 	if (!resp)
 		return -ENOMEM;
 
@@ -1030,6 +1030,8 @@ static int fcp_init(struct usb_mixer_interface *mixer,
 		step0_resp, private->step0_resp_size);
 	if (err < 0)
 		return err;
+	if (err != private->step0_resp_size)
+		return -EIO;
 
 	err = fcp_init_notify(mixer);
 	if (err < 0)
