@@ -635,6 +635,49 @@ out:
 }
 
 /**
+ * icc_get_by_id() - get a path handle between two endpoints given by node id
+ * @dev: device pointer for the consumer device
+ * @src_id: source node id
+ * @dst_id: destination node id
+ *
+ * FP6: the numeric form icc_get() had up to 6.6. Qualcomm's camera driver for the FP6 builds
+ * its paths from the node ids of the device tree bindings.
+ *
+ * Return: icc_path pointer on success or ERR_PTR() on error.
+ */
+struct icc_path *icc_get_by_id(struct device *dev, int src_id, int dst_id)
+{
+	struct icc_node *src, *dst;
+	struct icc_path *path = ERR_PTR(-EPROBE_DEFER);
+
+	mutex_lock(&icc_lock);
+
+	src = node_find(src_id);
+	if (!src)
+		goto out;
+
+	dst = node_find(dst_id);
+	if (!dst)
+		goto out;
+
+	path = path_find(dev, src, dst);
+	if (IS_ERR(path)) {
+		dev_err(dev, "%s: invalid path=%ld\n", __func__, PTR_ERR(path));
+		goto out;
+	}
+
+	path->name = kasprintf(GFP_KERNEL, "%s-%s", src->name, dst->name);
+	if (!path->name) {
+		kfree(path);
+		path = ERR_PTR(-ENOMEM);
+	}
+out:
+	mutex_unlock(&icc_lock);
+	return path;
+}
+EXPORT_SYMBOL_GPL(icc_get_by_id);
+
+/**
  * icc_set_tag() - set an optional tag on a path
  * @path: the path we want to tag
  * @tag: the tag value
