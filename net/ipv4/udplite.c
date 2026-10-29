@@ -11,7 +11,9 @@
 #define pr_fmt(fmt) "UDPLite: " fmt
 
 #include <linux/export.h>
+#include <linux/icmp.h>
 #include <linux/proc_fs.h>
+#include <net/route.h>
 #include "udp_impl.h"
 
 struct udp_table 	udplite_table __read_mostly;
@@ -32,6 +34,16 @@ static int udplite_rcv(struct sk_buff *skb)
 
 static int udplite_err(struct sk_buff *skb, u32 info)
 {
+	const int type = icmp_hdr(skb)->type;
+	const int code = icmp_hdr(skb)->code;
+	struct net *net = dev_net(skb->dev);
+
+	/* Create the exception before the socket lookup, as udp_err() does. */
+	if (type == ICMP_DEST_UNREACH && code == ICMP_FRAG_NEEDED)
+		ipv4_update_pmtu(skb, net, info, 0, IPPROTO_UDPLITE);
+	else if (type == ICMP_REDIRECT)
+		ipv4_redirect(skb, net, 0, IPPROTO_UDPLITE);
+
 	return __udp4_lib_err(skb, info, &udplite_table);
 }
 
