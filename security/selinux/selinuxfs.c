@@ -135,6 +135,9 @@ static ssize_t sel_read_enforce(struct file *filp, char __user *buf,
 }
 
 #ifdef CONFIG_SECURITY_SELINUX_DEVELOP
+/* Serialises enforcing changes, so the page is never written after it is locked. */
+static DEFINE_MUTEX(sel_enforce_mutex);
+
 static ssize_t sel_write_enforce(struct file *file, const char __user *buf,
 				 size_t count, loff_t *ppos)
 
@@ -161,13 +164,25 @@ static ssize_t sel_write_enforce(struct file *file, const char __user *buf,
 
 	new_value = !!scan_value;
 
+	mutex_lock(&sel_enforce_mutex);
 	old_value = enforcing_enabled();
+	if (old_value && !new_value) {
+		/* Enforcing is locked on once it has been turned on. */
+		audit_log(audit_context(), GFP_KERNEL, AUDIT_MAC_STATUS,
+			"enforcing=%d old_enforcing=%d auid=%u ses=%u"
+			" enabled=1 old-enabled=1 lsm=selinux res=0",
+			new_value, old_value,
+			from_kuid(&init_user_ns, audit_get_loginuid(current)),
+			audit_get_sessionid(current));
+		length = -EPERM;
+		goto out_unlock;
+	}
 	if (new_value != old_value) {
 		length = avc_has_perm(current_sid(), SECINITSID_SECURITY,
 				      SECCLASS_SECURITY, SECURITY__SETENFORCE,
 				      NULL);
 		if (length)
-			goto out;
+			goto out_unlock;
 		audit_log(audit_context(), GFP_KERNEL, AUDIT_MAC_STATUS,
 			"enforcing=%d old_enforcing=%d auid=%u ses=%u"
 			" enabled=1 old-enabled=1 lsm=selinux res=1",
@@ -183,8 +198,12 @@ static ssize_t sel_write_enforce(struct file *file, const char __user *buf,
 			call_blocking_lsm_notifier(LSM_POLICY_CHANGE, NULL);
 
 		selinux_ima_measure_state();
+		if (new_value)
+			selinux_enforcing_lock();
 	}
 	length = count;
+out_unlock:
+	mutex_unlock(&sel_enforce_mutex);
 out:
 	kfree(page);
 	return length;
