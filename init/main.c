@@ -850,6 +850,27 @@ static int __init early_randomize_kstack_offset(char *buf)
 early_param("randomize_kstack_offset", early_randomize_kstack_offset);
 #endif
 
+/*
+ * Parameters the kernel does not use are passed to init, as arguments or as
+ * environment strings. They can carry device identifiers (a bootloader can
+ * pass the Wi-Fi MAC address this way), so the kernel log shows their names
+ * only, never their values.
+ */
+static int param_name_len(const char *param)
+{
+	return strcspn(param, "=");
+}
+
+static bool __init passed_to_init_env(const char *name, size_t len)
+{
+	const char *const *p;
+
+	for (p = envp_init; *p; p++)
+		if (!strncmp(*p, name, len) && (*p)[len] == '=')
+			return true;
+	return false;
+}
+
 static void __init print_unknown_bootoptions(void)
 {
 	char *unknown_options;
@@ -883,9 +904,9 @@ static void __init print_unknown_bootoptions(void)
 	end = unknown_options;
 
 	for (p = &argv_init[1]; *p; p++)
-		end += sprintf(end, " %s", *p);
+		end += sprintf(end, " %.*s", param_name_len(*p), *p);
 	for (p = &envp_init[2]; *p; p++)
-		end += sprintf(end, " %s", *p);
+		end += sprintf(end, " %.*s", param_name_len(*p), *p);
 
 	/* Start at unknown_options[1] to skip the initial space */
 	pr_notice("Unknown kernel command line parameters \"%s\", will be passed to user space.\n",
@@ -1026,6 +1047,81 @@ static void __init print_kernel_cmdline(const char *cmdline)
 		pr_notice("%s%s\n", KERNEL_CMDLINE_PREFIX, cmdline);
 }
 
+/*
+ * Copy the command line to @d without the values of parameters passed to
+ * user space: those in init's environment and everything after "--". With
+ * @modules_only, drop the values of kernel parameters too and keep only
+ * those of module options ("module.param=value"). Tokens are split as
+ * next_arg() splits them.
+ */
+static void __init copy_cmdline_names(char *d, const char *s, bool modules_only)
+{
+	bool init_args = false;
+
+	while (*s) {
+		const char *start = s, *name = s, *equals = NULL, *end;
+		bool in_quote = false;
+
+		if (isspace(*s)) {
+			*d++ = *s++;
+			continue;
+		}
+		for (; *s && (in_quote || !isspace(*s)); s++) {
+			if (*s == '=' && !equals)
+				equals = s;
+			if (*s == '"')
+				in_quote = !in_quote;
+		}
+		end = s;
+		if (*name == '"')
+			name++;
+		if (!equals) {
+			const char *last = end - (end > name && end[-1] == '"');
+
+			if (last - name == 2 && !strncmp(name, "--", 2))
+				init_args = true;
+		} else if (equals > name &&
+			   (init_args || panic_later ||
+			    (modules_only ? !memchr(name, '.', equals - name) :
+			     passed_to_init_env(name, equals - name)))) {
+			start = name;
+			end = equals;
+		}
+		memcpy(d, start, end - start);
+		d += end - start;
+	}
+	*d = '\0';
+}
+
+/* What /proc/cmdline shows once init runs. Set up below. */
+static char *names_command_line __ro_after_init;
+
+/*
+ * Print the command line without the values of parameters passed to user
+ * space, and prepare the copy /proc/cmdline shows from init on: names only,
+ * except the values of module options, which Android's modprobe reads from
+ * /proc/cmdline. The kernel has used every other value by then, and the
+ * bootloader's values can carry device identifiers (some pass the Wi-Fi MAC
+ * address), which bug reports would copy. Call it after the command line
+ * has been parsed, when the environment is complete.
+ */
+static void __init print_kernel_cmdline_names(const char *cmdline)
+{
+	size_t size = strlen(cmdline) + 1;
+	char *out;
+
+	out = memblock_alloc(size, SMP_CACHE_BYTES);
+	if (!out) {
+		pr_err("%s: Failed to allocate %zu bytes\n", __func__, size);
+		return;
+	}
+	copy_cmdline_names(out, cmdline, false);
+	print_kernel_cmdline(out);
+	/* Dropping values only shortens the line, so the buffer fits. */
+	copy_cmdline_names(out, cmdline, true);
+	names_command_line = out;
+}
+
 asmlinkage __visible __init __no_sanitize_address __noreturn __no_stack_protector
 void start_kernel(void)
 {
@@ -1065,7 +1161,6 @@ void start_kernel(void)
 	early_numa_node_init();
 	boot_cpu_hotplug_init();
 
-	print_kernel_cmdline(saved_command_line);
 	/* parameters may set static keys */
 	parse_early_param();
 	after_dashes = parse_args("Booting kernel",
@@ -1073,6 +1168,7 @@ void start_kernel(void)
 				  __stop___param - __start___param,
 				  -1, -1, NULL, &unknown_bootoption);
 	print_unknown_bootoptions();
+	print_kernel_cmdline_names(saved_command_line);
 	if (!IS_ERR_OR_NULL(after_dashes))
 		parse_args("Setting init args", after_dashes, NULL, 0, -1, -1,
 			   NULL, set_init_arg);
@@ -1520,10 +1616,10 @@ static int run_init_process(const char *init_filename)
 	pr_info("Run %s as init process\n", init_filename);
 	pr_debug("  with arguments:\n");
 	for (p = argv_init; *p; p++)
-		pr_debug("    %s\n", *p);
+		pr_debug("    %.*s\n", param_name_len(*p), *p);
 	pr_debug("  with environment:\n");
 	for (p = envp_init; *p; p++)
-		pr_debug("    %s\n", *p);
+		pr_debug("    %.*s\n", param_name_len(*p), *p);
 	return kernel_execve(init_filename, argv_init, envp_init);
 }
 
@@ -1606,6 +1702,15 @@ static int __ref kernel_init(void *unused)
 	kernel_init_freeable();
 	/* need to finish all async __init code before freeing the memory */
 	async_synchronize_full();
+
+	/*
+	 * The initcalls have read their parameters from saved_command_line.
+	 * User space gets the names-only copy. saved_command_line becomes
+	 * read-only below, so swap it now. do_sysctl_args() still finds the
+	 * sysctl.* values, they keep them as module options do.
+	 */
+	if (names_command_line)
+		saved_command_line = names_command_line;
 
 	system_state = SYSTEM_FREEING_INITMEM;
 	kprobe_free_init_mem();
