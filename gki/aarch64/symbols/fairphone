@@ -1,0 +1,8 @@
+[abi_symbol_list]
+  icc_get_by_id
+  __root_device_register
+  root_device_unregister
+  security_current_getlsmprop_subj
+  security_lsmprop_to_secctx
+  v4l2_prio_close
+  v4l2_prio_open
