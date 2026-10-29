@@ -28,6 +28,8 @@
 #include <linux/errno.h>
 #include <linux/sched/signal.h>
 #include <linux/sched/task.h>
+#include <linux/set_memory.h>
+#include <linux/vmalloc.h>
 #include <linux/lsm_hooks.h>
 #include <linux/xattr.h>
 #include <linux/capability.h>
@@ -115,6 +117,31 @@ static atomic_t selinux_secmark_refcount = ATOMIC_INIT(0);
 
 #ifdef CONFIG_SECURITY_SELINUX_DEVELOP
 static int selinux_enforcing_boot __initdata;
+
+/* Points at selinux_state until selinux_init() moves it to its own page. */
+bool *selinux_enforcing __ro_after_init = &selinux_state.enforcing;
+
+/*
+ * Make the enforcing mode read-only. Called once enforcing is on. After this
+ * neither sel_write_enforce() nor a stray kernel write can turn it off.
+ */
+void selinux_enforcing_lock(void)
+{
+	if (!is_vmalloc_addr(selinux_enforcing))
+		return;
+	if (set_memory_ro((unsigned long)selinux_enforcing, 1))
+		pr_err("SELinux:  could not make the enforcing mode read-only\n");
+	else
+		pr_info("SELinux:  enforcing is locked on\n");
+}
+
+static int __init selinux_enforcing_lock_boot(void)
+{
+	if (enforcing_enabled())
+		selinux_enforcing_lock();
+	return 0;
+}
+late_initcall(selinux_enforcing_lock_boot);
 
 static int __init enforcing_setup(char *str)
 {
@@ -7849,6 +7876,11 @@ static __init int selinux_init(void)
 	pr_info("SELinux:  Initializing.\n");
 
 	memset(&selinux_state, 0, sizeof(selinux_state));
+#ifdef CONFIG_SECURITY_SELINUX_DEVELOP
+	selinux_enforcing = vzalloc(PAGE_SIZE);
+	if (!selinux_enforcing)
+		panic("SELinux:  could not allocate the enforcing mode page\n");
+#endif
 	enforcing_set(selinux_enforcing_boot);
 	selinux_avc_init();
 	mutex_init(&selinux_state.status_lock);
