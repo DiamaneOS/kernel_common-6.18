@@ -260,6 +260,11 @@ static int tipc_enable_bearer(struct net *net, const char *name,
 	char *errstr = "";
 	u32 i;
 
+	if (IS_ENABLED(CONFIG_TIPC_LOCAL_ONLY)) {
+		NL_SET_ERR_MSG(extack, "Network bearers disabled by local-only policy");
+		return -EOPNOTSUPP;
+	}
+
 	if (!bearer_name_validate(name, &b_names)) {
 		NL_SET_ERR_MSG(extack, "Illegal name");
 		return res;
