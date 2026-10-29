@@ -86,7 +86,11 @@ static int thermal_of_populate_trip(struct device_node *np,
 		return ret;
 	}
 
-	trip->flags = THERMAL_TRIP_FLAG_RW_TEMP;
+	/*
+	 * FP6: the hysteresis stays writable, as with CONFIG_THERMAL_WRITABLE_TRIPS on 6.1. The thermal
+	 * HAL sets trip_point_N_hyst with the temperature of the next severity threshold.
+	 */
+	trip->flags = THERMAL_TRIP_FLAG_RW_TEMP | THERMAL_TRIP_FLAG_RW_HYST;
 
 	trip->priv = np;
 
