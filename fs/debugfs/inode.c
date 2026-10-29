@@ -917,20 +917,32 @@ static int __init debugfs_init(void)
 {
 	int retval;
 
-	if (!(debugfs_allow & DEBUGFS_ALLOW_MOUNT))
+	if (!(debugfs_allow & DEBUGFS_ALLOW_API))
 		return -EPERM;
-
-	retval = sysfs_create_mount_point(kernel_kobj, "debug");
-	if (retval)
-		return retval;
 
 	debugfs_inode_cachep = kmem_cache_create("debugfs_inode_cache",
 				sizeof(struct debugfs_inode_info), 0,
 				SLAB_RECLAIM_ACCOUNT | SLAB_ACCOUNT,
 				init_once);
-	if (debugfs_inode_cachep == NULL) {
-		sysfs_remove_mount_point(kernel_kobj, "debug");
+	if (debugfs_inode_cachep == NULL)
 		return -ENOMEM;
+
+	if (!(debugfs_allow & DEBUGFS_ALLOW_MOUNT)) {
+		/*
+		 * No mount (DEBUG_FS_DISALLOW_MOUNT or debugfs=no-mount): the
+		 * filesystem stays unregistered and /sys/kernel/debug absent,
+		 * so user space cannot mount it, but kernel clients keep the
+		 * API. Their files live on the internal mount that
+		 * debugfs_start_creating() pins.
+		 */
+		debugfs_registered = true;
+		return 0;
+	}
+
+	retval = sysfs_create_mount_point(kernel_kobj, "debug");
+	if (retval) {
+		kmem_cache_destroy(debugfs_inode_cachep);
+		return retval;
 	}
 
 	retval = register_filesystem(&debug_fs_type);
