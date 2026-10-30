@@ -339,10 +339,11 @@ static const struct reg_offset_data bam_v1_7_reg_info[] = {
 #define P_SW_OFSTS_MASK		0xffff
 
 #define BAM_DESC_FIFO_SIZE	SZ_32K
-#define MAX_DESCRIPTORS (BAM_DESC_FIFO_SIZE / sizeof(struct bam_desc_hw) - 1)
+/* a descriptor FIFO in the BAM's own memory */
+#define BAM_REMOTE_DESC_FIFO_SIZE	(32 * sizeof(struct bam_desc_hw))
 #define BAM_FIFO_SIZE	(SZ_32K - 8)
-#define IS_BUSY(chan)	(CIRC_SPACE(bchan->tail, bchan->head,\
-			 MAX_DESCRIPTORS + 1) == 0)
+#define IS_BUSY(chan)	(CIRC_SPACE((chan)->tail, (chan)->head,\
+			 (chan)->max_desc + 1) == 0)
 
 struct bam_chan {
 	struct virt_dma_chan vc;
@@ -355,9 +356,11 @@ struct bam_chan {
 	/* runtime configuration */
 	struct dma_slave_config slave;
 
-	/* fifo storage */
+	/* fifo storage, in system memory or in the BAM's own memory */
 	struct bam_desc_hw *fifo_virt;
+	struct bam_desc_hw __iomem *fifo_remote;
 	dma_addr_t fifo_phys;
+	u32 max_desc;			/* descriptors the fifo holds */
 
 	/* fifo markers */
 	unsigned short head;		/* start of active descriptor entries */
@@ -398,6 +401,15 @@ struct bam_device {
 
 	/* dma start transaction tasklet */
 	struct tasklet_struct task;
+
+	/*
+	 * Memory of a BAM that only fetches descriptors from there (bam_remote_mem), one
+	 * descriptor FIFO slot per allocated channel.
+	 */
+	void __iomem *remote_mem;
+	phys_addr_t remote_mem_phys;
+	unsigned long *remote_slots_used;
+	u32 remote_slots;
 };
 
 /**
@@ -500,7 +512,7 @@ static void bam_chan_init_hw(struct bam_chan *bchan,
 	 */
 	writel_relaxed(ALIGN(bchan->fifo_phys, sizeof(struct bam_desc_hw)),
 			bam_addr(bdev, bchan->id, BAM_P_DESC_FIFO_ADDR));
-	writel_relaxed(BAM_FIFO_SIZE,
+	writel_relaxed(bchan->max_desc * sizeof(struct bam_desc_hw),
 			bam_addr(bdev, bchan->id, BAM_P_FIFO_SIZES));
 
 	/* enable the per pipe interrupts, enable EOT, ERR, and INT irqs */
@@ -539,18 +551,34 @@ static int bam_alloc_chan(struct dma_chan *chan)
 {
 	struct bam_chan *bchan = to_bam_chan(chan);
 	struct bam_device *bdev = bchan->bdev;
+	u32 fifo_size = BAM_DESC_FIFO_SIZE;
+	unsigned int slot;
 
-	if (bchan->fifo_virt)
+	if (bchan->fifo_virt || bchan->fifo_remote)
 		return 0;
 
-	/* allocate FIFO descriptor space, but only if necessary */
-	bchan->fifo_virt = dma_alloc_wc(bdev->dev, BAM_DESC_FIFO_SIZE,
-					&bchan->fifo_phys, GFP_KERNEL);
+	if (bdev->remote_mem) {
+		slot = find_first_zero_bit(bdev->remote_slots_used, bdev->remote_slots);
+		if (slot >= bdev->remote_slots) {
+			dev_err(bdev->dev, "No remote desc fifo left\n");
+			return -ENOMEM;
+		}
+		set_bit(slot, bdev->remote_slots_used);
+		fifo_size = BAM_REMOTE_DESC_FIFO_SIZE;
+		bchan->fifo_remote = bdev->remote_mem + slot * fifo_size;
+		bchan->fifo_phys = bdev->remote_mem_phys + slot * fifo_size;
+		memset_io(bchan->fifo_remote, 0, fifo_size);
+	} else {
+		/* allocate FIFO descriptor space, but only if necessary */
+		bchan->fifo_virt = dma_alloc_wc(bdev->dev, BAM_DESC_FIFO_SIZE,
+						&bchan->fifo_phys, GFP_KERNEL);
 
-	if (!bchan->fifo_virt) {
-		dev_err(bdev->dev, "Failed to allocate desc fifo\n");
-		return -ENOMEM;
+		if (!bchan->fifo_virt) {
+			dev_err(bdev->dev, "Failed to allocate desc fifo\n");
+			return -ENOMEM;
+		}
 	}
+	bchan->max_desc = fifo_size / sizeof(struct bam_desc_hw) - 1;
 
 	if (bdev->active_channels++ == 0 && bdev->powered_remotely)
 		bam_reset(bdev);
@@ -588,9 +616,15 @@ static void bam_free_chan(struct dma_chan *chan)
 	bam_reset_channel(bchan);
 	spin_unlock_irqrestore(&bchan->vc.lock, flags);
 
-	dma_free_wc(bdev->dev, BAM_DESC_FIFO_SIZE, bchan->fifo_virt,
-		    bchan->fifo_phys);
-	bchan->fifo_virt = NULL;
+	if (bchan->fifo_remote) {
+		clear_bit((bchan->fifo_phys - bdev->remote_mem_phys) /
+			  BAM_REMOTE_DESC_FIFO_SIZE, bdev->remote_slots_used);
+		bchan->fifo_remote = NULL;
+	} else {
+		dma_free_wc(bdev->dev, BAM_DESC_FIFO_SIZE, bchan->fifo_virt,
+			    bchan->fifo_phys);
+		bchan->fifo_virt = NULL;
+	}
 
 	/* mask irq for pipe/channel */
 	val = readl_relaxed(bam_addr(bdev, 0, BAM_IRQ_SRCS_MSK_EE));
@@ -853,7 +887,7 @@ static u32 process_channel_irqs(struct bam_device *bdev)
 		offset /= sizeof(struct bam_desc_hw);
 
 		/* Number of bytes available to read */
-		avail = CIRC_CNT(offset, bchan->head, MAX_DESCRIPTORS + 1);
+		avail = CIRC_CNT(offset, bchan->head, bchan->max_desc + 1);
 
 		if (offset < bchan->head)
 			avail--;
@@ -866,7 +900,7 @@ static u32 process_channel_irqs(struct bam_device *bdev)
 
 			/* manage FIFO */
 			bchan->head += async_desc->xfer_len;
-			bchan->head %= MAX_DESCRIPTORS;
+			bchan->head %= bchan->max_desc;
 
 			async_desc->num_desc -= async_desc->xfer_len;
 			async_desc->curr_desc += async_desc->xfer_len;
@@ -1009,6 +1043,27 @@ static void bam_apply_new_config(struct bam_chan *bchan,
 }
 
 /**
+ * bam_fifo_write - copy descriptors into the channel's descriptor fifo
+ * @bchan: bam dma channel
+ * @index: first fifo entry
+ * @desc: descriptors
+ * @count: number of descriptors
+ */
+static void bam_fifo_write(struct bam_chan *bchan, u32 index,
+			   const struct bam_desc_hw *desc, u32 count)
+{
+	struct bam_desc_hw *fifo;
+
+	if (bchan->fifo_remote) {
+		memcpy_toio(&bchan->fifo_remote[index], desc, count * sizeof(*desc));
+		return;
+	}
+
+	fifo = PTR_ALIGN(bchan->fifo_virt, sizeof(struct bam_desc_hw));
+	memcpy(&fifo[index], desc, count * sizeof(*desc));
+}
+
+/**
  * bam_start_dma - start next transaction
  * @bchan: bam dma channel
  */
@@ -1018,8 +1073,6 @@ static void bam_start_dma(struct bam_chan *bchan)
 	struct bam_device *bdev = bchan->bdev;
 	struct bam_async_desc *async_desc = NULL;
 	struct bam_desc_hw *desc;
-	struct bam_desc_hw *fifo = PTR_ALIGN(bchan->fifo_virt,
-					sizeof(struct bam_desc_hw));
 	int ret;
 	unsigned int avail;
 	struct dmaengine_desc_callback cb;
@@ -1048,7 +1101,7 @@ static void bam_start_dma(struct bam_chan *bchan)
 
 		desc = async_desc->curr_desc;
 		avail = CIRC_SPACE(bchan->tail, bchan->head,
-				   MAX_DESCRIPTORS + 1);
+				   bchan->max_desc + 1);
 
 		if (async_desc->num_desc > avail)
 			async_desc->xfer_len = avail;
@@ -1078,22 +1131,19 @@ static void bam_start_dma(struct bam_chan *bchan)
 			desc[async_desc->xfer_len - 1].flags |=
 				cpu_to_le16(DESC_FLAG_INT);
 
-		if (bchan->tail + async_desc->xfer_len > MAX_DESCRIPTORS) {
-			u32 partial = MAX_DESCRIPTORS - bchan->tail;
+		if (bchan->tail + async_desc->xfer_len > bchan->max_desc) {
+			u32 partial = bchan->max_desc - bchan->tail;
 
-			memcpy(&fifo[bchan->tail], desc,
-			       partial * sizeof(struct bam_desc_hw));
-			memcpy(fifo, &desc[partial],
-			       (async_desc->xfer_len - partial) *
-				sizeof(struct bam_desc_hw));
+			bam_fifo_write(bchan, bchan->tail, desc, partial);
+			bam_fifo_write(bchan, 0, &desc[partial],
+				       async_desc->xfer_len - partial);
 		} else {
-			memcpy(&fifo[bchan->tail], desc,
-			       async_desc->xfer_len *
-			       sizeof(struct bam_desc_hw));
+			bam_fifo_write(bchan, bchan->tail, desc,
+				       async_desc->xfer_len);
 		}
 
 		bchan->tail += async_desc->xfer_len;
-		bchan->tail %= MAX_DESCRIPTORS;
+		bchan->tail %= bchan->max_desc;
 		list_add_tail(&async_desc->desc_node, &bchan->desc_list);
 	}
 
@@ -1237,6 +1287,7 @@ static int bam_dma_probe(struct platform_device *pdev)
 {
 	struct bam_device *bdev;
 	const struct of_device_id *match;
+	struct resource *res;
 	int ret, i;
 
 	bdev = devm_kzalloc(&pdev->dev, sizeof(*bdev), GFP_KERNEL);
@@ -1256,6 +1307,20 @@ static int bam_dma_probe(struct platform_device *pdev)
 	bdev->regs = devm_platform_ioremap_resource(pdev, 0);
 	if (IS_ERR(bdev->regs))
 		return PTR_ERR(bdev->regs);
+
+	res = platform_get_resource_byname(pdev, IORESOURCE_MEM, "bam_remote_mem");
+	if (res) {
+		bdev->remote_mem = devm_ioremap_resource(&pdev->dev, res);
+		if (IS_ERR(bdev->remote_mem))
+			return PTR_ERR(bdev->remote_mem);
+		bdev->remote_mem_phys = res->start;
+		bdev->remote_slots = resource_size(res) / BAM_REMOTE_DESC_FIFO_SIZE;
+		bdev->remote_slots_used = devm_bitmap_zalloc(&pdev->dev,
+							     bdev->remote_slots,
+							     GFP_KERNEL);
+		if (!bdev->remote_slots_used)
+			return -ENOMEM;
+	}
 
 	bdev->irq = platform_get_irq(pdev, 0);
 	if (bdev->irq < 0)
