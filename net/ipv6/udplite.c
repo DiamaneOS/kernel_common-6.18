@@ -11,7 +11,10 @@
 #define pr_fmt(fmt) "UDPLite6: " fmt
 
 #include <linux/export.h>
+#include <linux/icmpv6.h>
 #include <linux/proc_fs.h>
+#include <net/ip6_route.h>
+#include <net/ndisc.h>
 #include "udp_impl.h"
 
 static int udplitev6_sk_init(struct sock *sk)
@@ -30,6 +33,16 @@ static int udplitev6_err(struct sk_buff *skb,
 			  struct inet6_skb_parm *opt,
 			  u8 type, u8 code, int offset, __be32 info)
 {
+	struct net *net = dev_net(skb->dev);
+
+	/* Create the exception before the socket lookup, as udpv6_err() does. */
+	if (type == ICMPV6_PKT_TOOBIG)
+		ip6_update_pmtu(skb, net, info, skb->dev->ifindex, 0,
+				sock_net_uid(net, NULL));
+	else if (type == NDISC_REDIRECT)
+		ip6_redirect(skb, net, skb->dev->ifindex, 0,
+			     sock_net_uid(net, NULL));
+
 	return __udp6_lib_err(skb, opt, type, code, offset, info,
 			      &udplite_table);
 }
