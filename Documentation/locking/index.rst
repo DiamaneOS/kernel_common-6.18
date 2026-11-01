@@ -12,6 +12,7 @@ Locking
     lockstat
     locktorture
     mutex-design
+    proxy-mutex-test
     rt-mutex-design
     rt-mutex
     seqlock
