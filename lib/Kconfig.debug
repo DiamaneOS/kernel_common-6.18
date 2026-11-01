@@ -1602,6 +1602,29 @@ config LOCK_TORTURE_TEST
 	  Say M if you want these torture tests to build as a module.
 	  Say N if you are unsure.
 
+config PROXY_MUTEX_KUNIT_TEST
+	bool "KUnit tests for mutex proxy execution"
+	depends on KUNIT=y && SMP && SCHED_PROXY_EXEC
+	depends on MUTEX_SPIN_ON_OWNER
+	depends on !DEBUG_MUTEXES && !PROVE_LOCKING
+	depends on TRACING_SUPPORT
+	select TRACING
+	select ANDROID_VENDOR_HOOKS
+	help
+	  Check that recursive mutex waits do not starve unrelated work on
+	  the waiter's CPU, and that ordinary contention, handoff and signal
+	  cancellation still work. These tests intentionally attempt recursive
+	  locking and must run in a disposable test kernel with at least two
+	  CPUs. They are not enabled by KUNIT_ALL_TESTS.
+	  Each case runs with normal optimistic spinning and with spinning
+	  suppressed for its test mutex through vendor hooks, in one build.
+	  A mutex spin hook also detects transient self-spinning after wakeup,
+	  which a heartbeat alone can miss when rescheduling breaks the spin.
+	  See Documentation/locking/proxy-mutex-test.rst for the two-CPU
+	  invocation and proxy-execution on/off runs. Too few CPUs is a failure.
+
+	  If unsure, say N.
+
 config WW_MUTEX_SELFTEST
 	tristate "Wait/wound mutex selftests"
 	help

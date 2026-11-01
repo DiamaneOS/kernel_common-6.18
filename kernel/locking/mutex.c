@@ -30,6 +30,7 @@
 #include <linux/debug_locks.h>
 #include <linux/osq_lock.h>
 #include <linux/hung_task.h>
+#include <linux/printk.h>
 
 #define CREATE_TRACE_POINTS
 #include <trace/events/lock.h>
@@ -589,6 +590,7 @@ __mutex_lock_common(struct mutex *lock, unsigned int state, unsigned int subclas
 	struct mutex_waiter waiter;
 	struct ww_mutex *ww;
 	unsigned long flags;
+	bool self_deadlock;
 	int ret;
 
 	if (!use_ww_ctx)
@@ -621,7 +623,8 @@ __mutex_lock_common(struct mutex *lock, unsigned int state, unsigned int subclas
 
 	trace_contention_begin(lock, LCB_F_MUTEX | LCB_F_SPIN);
 	if (__mutex_trylock(lock) ||
-	    mutex_optimistic_spin(lock, ww_ctx, NULL)) {
+	    (__mutex_owner(lock) != current &&
+	     mutex_optimistic_spin(lock, ww_ctx, NULL))) {
 		/* got the lock, yay! */
 		lock_acquired(&lock->dep_map, ip);
 		if (ww_ctx)
@@ -642,6 +645,18 @@ __mutex_lock_common(struct mutex *lock, unsigned int state, unsigned int subclas
 
 		goto skip_wait;
 	}
+
+	/*
+	 * A failed trylock under wait_lock with current still owning the mutex
+	 * is a recursive acquisition: a pending handoff to current would have
+	 * been picked up above. Do not let this waiter donate execution to
+	 * itself and keep its CPU retrying forever. Without a blocked_on
+	 * relationship it sleeps normally, including after spurious wakeups.
+	 */
+	self_deadlock = __mutex_owner(lock) == current;
+	if (unlikely(self_deadlock))
+		pr_warn_once("mutex: recursive locking by %s/%d at %pS\n",
+			     current->comm, task_pid_nr(current), (void *)ip);
 
 	debug_mutex_lock_common(lock, &waiter);
 	waiter.task = current;
@@ -665,7 +680,8 @@ __mutex_lock_common(struct mutex *lock, unsigned int state, unsigned int subclas
 
 	raw_spin_lock(&current->blocked_lock);
 	trace_android_vh_mutex_wait_start(lock);
-	__set_task_blocked_on(current, lock, BO_T_MUTEX);
+	if (!self_deadlock)
+		__set_task_blocked_on(current, lock, BO_T_MUTEX);
 	set_current_state(state);
 	trace_contention_begin(lock, LCB_F_MUTEX);
 	for (;;) {
@@ -710,7 +726,8 @@ __mutex_lock_common(struct mutex *lock, unsigned int state, unsigned int subclas
 		 * that has cleared our blocked_on state, re-set
 		 * it to the lock we are trying to acquire.
 		 */
-		__set_task_blocked_on(current, lock, BO_T_MUTEX);
+		if (!self_deadlock)
+			__set_task_blocked_on(current, lock, BO_T_MUTEX);
 		set_current_state(state);
 		/*
 		 * Here we order against unlock; we must either see it change
@@ -734,11 +751,14 @@ __mutex_lock_common(struct mutex *lock, unsigned int state, unsigned int subclas
 			raw_spin_unlock_irqrestore(&lock->wait_lock, flags);
 
 			trace_contention_begin(lock, LCB_F_MUTEX | LCB_F_SPIN);
-			opt_acquired = mutex_optimistic_spin(lock, ww_ctx, &waiter);
+			/* A recursive waiter can wake with HANDOFF already set. */
+			opt_acquired = __mutex_owner(lock) != current &&
+				mutex_optimistic_spin(lock, ww_ctx, &waiter);
 
 			raw_spin_lock_irqsave(&lock->wait_lock, flags);
 			raw_spin_lock(&current->blocked_lock);
-			__set_task_blocked_on(current, lock, BO_T_MUTEX);
+			if (!self_deadlock)
+				__set_task_blocked_on(current, lock, BO_T_MUTEX);
 			set_current_state(state);
 
 			if (opt_acquired)
