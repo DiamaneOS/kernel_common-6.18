@@ -11,6 +11,7 @@
 #include <linux/blk-mq.h>
 #include <linux/delay.h>
 #include <linux/scatterlist.h>
+#include <linux/sched/mm.h>
 #include <linux/bsg-lib.h>
 #include <linux/export.h>
 #include <scsi/scsi_cmnd.h>
@@ -278,6 +279,7 @@ static blk_status_t bsg_queue_rq(struct blk_mq_hw_ctx *hctx,
 	struct bsg_set *bset =
 		container_of(q->tag_set, struct bsg_set, tag_set);
 	blk_status_t sts = BLK_STS_IOERR;
+	unsigned int noio_flags;
 	int ret;
 
 	blk_mq_start_request(req);
@@ -285,6 +287,8 @@ static blk_status_t bsg_queue_rq(struct blk_mq_hw_ctx *hctx,
 	if (!get_device(dev))
 		return BLK_STS_IOERR;
 
+	/* A dispatch path: the payload map and the job may not recurse into I/O */
+	noio_flags = memalloc_noio_save();
 	if (!bsg_prepare_job(dev, req))
 		goto out;
 
@@ -293,6 +297,7 @@ static blk_status_t bsg_queue_rq(struct blk_mq_hw_ctx *hctx,
 		sts = BLK_STS_OK;
 
 out:
+	memalloc_noio_restore(noio_flags);
 	put_device(dev);
 	return sts;
 }
