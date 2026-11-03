@@ -94,11 +94,12 @@ static int _regulator_do_set_voltage(struct regulator_dev *rdev,
 				     int min_uV, int max_uV);
 static int regulator_balance_voltage(struct regulator_dev *rdev,
 				     suspend_state_t state);
-static struct regulator *create_regulator(struct regulator_dev *rdev,
-					  struct device *dev,
+static struct regulator *create_regulator(struct device *dev,
 					  const char *supply_name);
+static void attach_regulator(struct regulator *regulator,
+			     struct regulator_dev *rdev);
+static void free_regulator(struct regulator *regulator);
 static void destroy_regulator(struct regulator *regulator);
-static void _regulator_put(struct regulator *regulator);
 
 const char *rdev_get_name(struct regulator_dev *rdev)
 {
@@ -1642,7 +1643,7 @@ static int set_machine_constraints(struct regulator_dev *rdev)
 		     !regulator_is_enabled(rdev->supply))) {
 			ret = regulator_enable(rdev->supply);
 			if (ret < 0) {
-				_regulator_put(rdev->supply);
+				regulator_put(rdev->supply);
 				rdev->supply = NULL;
 				return ret;
 			}
@@ -1674,6 +1675,7 @@ static int set_machine_constraints(struct regulator_dev *rdev)
  * set_supply - set regulator supply regulator
  * @rdev: regulator (locked)
  * @supply_rdev: supply regulator (locked))
+ * @supply: consumer of @supply_rdev, allocated by the caller
  *
  * Called by platform initialisation code to set the supply regulator for this
  * regulator. This ensures that a regulators supply will also be enabled by the
@@ -1682,21 +1684,16 @@ static int set_machine_constraints(struct regulator_dev *rdev)
  * Return: 0 on success or a negative error number on failure.
  */
 static int set_supply(struct regulator_dev *rdev,
-		      struct regulator_dev *supply_rdev)
+		      struct regulator_dev *supply_rdev,
+		      struct regulator *supply)
 {
-	int err;
-
 	rdev_dbg(rdev, "supplied by %s\n", rdev_get_name(supply_rdev));
 
 	if (!try_module_get(supply_rdev->owner))
 		return -ENODEV;
 
-	rdev->supply = create_regulator(supply_rdev, &rdev->dev, "SUPPLY");
-	if (rdev->supply == NULL) {
-		module_put(supply_rdev->owner);
-		err = -ENOMEM;
-		return err;
-	}
+	attach_regulator(supply, supply_rdev);
+	rdev->supply = supply;
 	supply_rdev->open_count++;
 
 	return 0;
@@ -1878,13 +1875,14 @@ static void link_and_create_debugfs(struct regulator *regulator, struct regulato
 	}
 }
 
-static struct regulator *create_regulator(struct regulator_dev *rdev,
-					  struct device *dev,
+/*
+ * Storage drivers enable regulators on their I/O path, so direct reclaim can
+ * wait for regulator locks. Never allocate with one of them held.
+ */
+static struct regulator *create_regulator(struct device *dev,
 					  const char *supply_name)
 {
 	struct regulator *regulator;
-
-	lockdep_assert_held_once(&rdev->mutex.base);
 
 	if (dev) {
 		supply_name = kasprintf(GFP_KERNEL, "%s-%s", dev->kobj.name, supply_name);
@@ -1902,9 +1900,17 @@ static struct regulator *create_regulator(struct regulator_dev *rdev,
 		return NULL;
 	}
 
-	regulator->rdev = rdev;
 	regulator->supply_name = supply_name;
 
+	return regulator;
+}
+
+static void attach_regulator(struct regulator *regulator,
+			     struct regulator_dev *rdev)
+{
+	lockdep_assert_held_once(&rdev->mutex.base);
+
+	regulator->rdev = rdev;
 	list_add(&regulator->list, &rdev->consumer_list);
 
 	/*
@@ -1915,8 +1921,12 @@ static struct regulator *create_regulator(struct regulator_dev *rdev,
 	if (!regulator_ops_is_valid(rdev, REGULATOR_CHANGE_STATUS) &&
 	    _regulator_is_enabled(rdev))
 		regulator->always_on = true;
+}
 
-	return regulator;
+static void free_regulator(struct regulator *regulator)
+{
+	kfree_const(regulator->supply_name);
+	kfree(regulator);
 }
 
 static int _regulator_get_enable_time(struct regulator_dev *rdev)
@@ -2046,6 +2056,7 @@ static struct regulator_dev *regulator_dev_lookup(struct device *dev,
 static int regulator_resolve_supply(struct regulator_dev *rdev)
 {
 	struct regulator_dev *r;
+	struct regulator *new_supply;
 	struct device *dev = rdev->dev.parent;
 	struct ww_acquire_ctx ww_ctx;
 	int ret = 0;
@@ -2127,6 +2138,13 @@ static int regulator_resolve_supply(struct regulator_dev *rdev)
 		goto out;
 	}
 
+	new_supply = create_regulator(&rdev->dev, "SUPPLY");
+	if (!new_supply) {
+		put_device(&r->dev);
+		ret = -ENOMEM;
+		goto out;
+	}
+
 	/*
 	 * Recheck rdev->supply with rdev->mutex lock held to avoid a race
 	 * between rdev->supply null check and setting rdev->supply in
@@ -2137,13 +2155,15 @@ static int regulator_resolve_supply(struct regulator_dev *rdev)
 	/* Supply just resolved by a concurrent task? */
 	if (rdev->supply) {
 		regulator_unlock_two(rdev, r, &ww_ctx);
+		free_regulator(new_supply);
 		put_device(&r->dev);
 		goto out;
 	}
 
-	ret = set_supply(rdev, r);
+	ret = set_supply(rdev, r, new_supply);
 	if (ret < 0) {
 		regulator_unlock_two(rdev, r, &ww_ctx);
+		free_regulator(new_supply);
 		put_device(&r->dev);
 		goto out;
 	}
@@ -2291,15 +2311,17 @@ struct regulator *_regulator_get_common(struct regulator_dev *rdev, struct devic
 		return regulator;
 	}
 
-	regulator_lock(rdev);
-	regulator = create_regulator(rdev, dev, id);
-	regulator_unlock(rdev);
+	regulator = create_regulator(dev, id);
 	if (regulator == NULL) {
 		regulator = ERR_PTR(-ENOMEM);
 		module_put(rdev->owner);
 		put_device(&rdev->dev);
 		return regulator;
 	}
+
+	regulator_lock(rdev);
+	attach_regulator(regulator, rdev);
+	regulator_unlock(rdev);
 
 	link_and_create_debugfs(regulator, rdev, dev);
 
@@ -2444,29 +2466,7 @@ static void destroy_regulator(struct regulator *regulator)
 	rdev->exclusive = 0;
 	regulator_unlock(rdev);
 
-	kfree_const(regulator->supply_name);
-	kfree(regulator);
-}
-
-/* regulator_list_mutex lock held by regulator_put() */
-static void _regulator_put(struct regulator *regulator)
-{
-	struct regulator_dev *rdev;
-
-	if (IS_ERR_OR_NULL(regulator))
-		return;
-
-	lockdep_assert_held_once(&regulator_list_mutex);
-
-	/* Docs say you must disable before calling regulator_put() */
-	WARN_ON(regulator->enable_count);
-
-	rdev = regulator->rdev;
-
-	destroy_regulator(regulator);
-
-	module_put(rdev->owner);
-	put_device(&rdev->dev);
+	free_regulator(regulator);
 }
 
 /**
@@ -2479,9 +2479,21 @@ static void _regulator_put(struct regulator *regulator)
  */
 void regulator_put(struct regulator *regulator)
 {
-	mutex_lock(&regulator_list_mutex);
-	_regulator_put(regulator);
-	mutex_unlock(&regulator_list_mutex);
+	struct regulator_dev *rdev;
+
+	if (IS_ERR_OR_NULL(regulator))
+		return;
+
+	/* Docs say you must disable before calling regulator_put() */
+	WARN_ON(regulator->enable_count);
+
+	rdev = regulator->rdev;
+
+	/* debugfs, sysfs and device link removal must not hold regulator locks */
+	destroy_regulator(regulator);
+
+	module_put(rdev->owner);
+	put_device(&rdev->dev);
 }
 EXPORT_SYMBOL_GPL(regulator_put);
 
@@ -6065,9 +6077,10 @@ void regulator_unregister(struct regulator_dev *rdev)
 	unset_regulator_supplies(rdev);
 	list_del(&rdev->list);
 	regulator_ena_gpio_free(rdev);
-	device_unregister(&rdev->dev);
 
 	mutex_unlock(&regulator_list_mutex);
+
+	device_unregister(&rdev->dev);
 }
 EXPORT_SYMBOL_GPL(regulator_unregister);
 
