@@ -20,6 +20,7 @@
 #include <linux/of.h>
 #include <linux/pm_runtime.h>
 #include <linux/sched.h>
+#include <linux/sched/mm.h>
 #include <linux/slab.h>
 #include <linux/spinlock.h>
 #include <linux/string.h>
@@ -31,6 +32,7 @@ static DEFINE_SPINLOCK(enable_lock);
 static DEFINE_MUTEX(prepare_lock);
 
 static struct task_struct *prepare_owner;
+static unsigned int prepare_noio_flags;
 static struct task_struct *enable_owner;
 
 static int prepare_refcnt;
@@ -233,6 +235,8 @@ static void clk_prepare_lock(void)
 	WARN_ON_ONCE(prepare_refcnt != 0);
 	prepare_owner = current;
 	prepare_refcnt = 1;
+	/* Storage clocks are prepared on the I/O path, so nothing under this lock may wait for I/O */
+	prepare_noio_flags = memalloc_noio_save();
 }
 
 static void clk_prepare_unlock(void)
@@ -242,6 +246,7 @@ static void clk_prepare_unlock(void)
 
 	if (--prepare_refcnt)
 		return;
+	memalloc_noio_restore(prepare_noio_flags);
 	prepare_owner = NULL;
 	mutex_unlock(&prepare_lock);
 }
