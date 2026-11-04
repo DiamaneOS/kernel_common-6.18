@@ -768,7 +768,7 @@ struct regmap *__regmap_init(struct device *dev,
 	if ((bus && bus->fast_io) || config->fast_io)
 		map->alloc_flags = GFP_ATOMIC;
 	else
-		map->alloc_flags = GFP_KERNEL;
+		map->alloc_flags = GFP_NOIO;
 
 	map->reg_base = config->reg_base;
 	map->reg_shift = config->pad_bits % 8;
