@@ -83,6 +83,16 @@ config IOMMU_IO_PGTABLE_DART
 
 endmenu
 
+config IOMMU_TLBSYNC_DEBUG
+	bool "Panic when an SMMU TLB sync times out"
+	help
+	  A TLB sync that times out can leave stale translations. This option
+	  panics there so the state stays available for debugging. It is for
+	  debug kernels only. Without it the timeout is logged and the kernel
+	  keeps running.
+
+	  If unsure, say N.
+
 config IOMMU_DEBUGFS
 	bool "Export IOMMU internals in DebugFS"
 	depends on DEBUG_FS
