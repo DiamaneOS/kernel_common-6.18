@@ -768,7 +768,7 @@ struct regmap *__regmap_init(struct device *dev,
 	if ((bus && bus->fast_io) || config->fast_io)
 		map->alloc_flags = GFP_ATOMIC;
 	else
-		map->alloc_flags = GFP_KERNEL;
+		map->alloc_flags = GFP_NOIO;
 
 	map->reg_base = config->reg_base;
 	map->reg_shift = config->pad_bits % 8;
@@ -1815,7 +1815,8 @@ static int _regmap_raw_write_impl(struct regmap *map, unsigned int reg,
 	/* If that didn't work fall back on linearising by hand. */
 	if (ret == -ENOTSUPP) {
 		len = map->format.reg_bytes + map->format.pad_bytes + val_len;
-		buf = kzalloc(len, GFP_KERNEL);
+		/* Under the map lock. A regulator on this map can be on the path of storage. */
+		buf = kzalloc(len, GFP_NOIO);
 		if (!buf)
 			return -ENOMEM;
 
@@ -2434,7 +2435,7 @@ static int _regmap_raw_multi_reg_write(struct regmap *map,
 	if (!len)
 		return -EINVAL;
 
-	buf = kzalloc(len, GFP_KERNEL);
+	buf = kzalloc(len, GFP_NOIO);
 	if (!buf)
 		return -ENOMEM;
 
