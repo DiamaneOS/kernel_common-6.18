@@ -214,13 +214,19 @@ void android_device_destroy(struct android_uevent_opts *opts)
 
 	flush_work(&opts->work);
 
+	/*
+	 * This sleeps, so it stays out of the lock. It comes before freeing the
+	 * id, which names the device. All devices here have devt 0, so
+	 * device_destroy() would find the first one and not this one.
+	 */
+	device_unregister(dev);
+
 	spin_lock_irqsave(&opts_lock, flags);
 	if (opts->device_id >= 0)
 		ida_free(&android_ida, opts->device_id);
 
 	android_opts = NULL;
 	ida_destroy(&opts->function_ida);
-	device_destroy(dev->class, dev->devt);
 	spin_unlock_irqrestore(&opts_lock, flags);
 }
 
