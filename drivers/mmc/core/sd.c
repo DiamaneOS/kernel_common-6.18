@@ -1044,7 +1044,7 @@ static int sd_write_ext_reg(struct mmc_card *card, u8 fno, u8 page, u16 offset,
 	struct scatterlist sg;
 	u8 *reg_buf;
 
-	reg_buf = kzalloc(512, GFP_KERNEL);
+	reg_buf = kzalloc(512, GFP_NOIO);
 	if (!reg_buf)
 		return -ENOMEM;
 
@@ -1338,7 +1338,7 @@ static int sd_flush_cache(struct mmc_host *host)
 	if (!sd_cache_enabled(host))
 		return 0;
 
-	reg_buf = kzalloc(512, GFP_KERNEL);
+	reg_buf = kzalloc(512, GFP_NOIO);
 	if (!reg_buf)
 		return -ENOMEM;
 
