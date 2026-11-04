@@ -581,6 +581,17 @@ static void thermal_zone_handle_trips(struct thermal_zone_device *tz,
 		 */
 		list_move(&td->list_node, &way_down_list);
 	}
+	/*
+	 * FP6: a trip that stayed reached is crossed again when the zone climbs back over its temperature.
+	 * The vendor thermal engine and thermal HAL wait for this event.
+	 */
+	if (tz->last_temperature != THERMAL_TEMP_INIT) {
+		list_for_each_entry(td, &tz->trips_reached, list_node) {
+			if (tz->last_temperature < td->trip.temperature &&
+			    tz->temperature >= td->trip.temperature)
+				thermal_notify_tz_trip_up(tz, &td->trip);
+		}
+	}
 	/* Check the trips that were previously above the zone temperature. */
 	list_for_each_entry_safe(td, next, &tz->trips_high, list_node) {
 		if (td->threshold > tz->temperature)
@@ -607,6 +618,25 @@ static void thermal_zone_handle_trips(struct thermal_zone_device *tz,
 		td = list_first_entry(&tz->trips_high,
 				      struct thermal_trip_desc, list_node);
 		*high = td->threshold;
+	}
+	/*
+	 * FP6: the vendor thermal engine and thermal HAL use each trip as a window, with the trip temperature
+	 * on top and that minus the hysteresis below, and rewrite it while the trip is reached. The sensor
+	 * must fire at both ends whatever the list of the trip, as the core did on 6.1. Otherwise the trip
+	 * stays reached between them and mitigation released there never comes back.
+	 */
+	for_each_trip_desc(tz, td) {
+		int trip_low;
+
+		if (td->trip.temperature == THERMAL_TEMP_INVALID)
+			continue;
+
+		trip_low = td->trip.temperature - td->trip.hysteresis;
+		if (trip_low < tz->temperature && trip_low > *low)
+			*low = trip_low;
+
+		if (td->trip.temperature > tz->temperature && td->trip.temperature < *high)
+			*high = td->trip.temperature;
 	}
 }
 
