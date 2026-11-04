@@ -797,12 +797,12 @@ static int __icc_enable(struct icc_path *path, bool enable)
 	if (WARN_ON(IS_ERR(path) || !path->num_nodes))
 		return -EINVAL;
 
-	mutex_lock(&icc_lock);
+	mutex_lock(&icc_bw_lock);
 
 	for (i = 0; i < path->num_nodes; i++)
 		path->reqs[i].enabled = enable;
 
-	mutex_unlock(&icc_lock);
+	mutex_unlock(&icc_bw_lock);
 
 	return icc_set_bw(path, path->reqs[0].avg_bw,
 			  path->reqs[0].peak_bw);
