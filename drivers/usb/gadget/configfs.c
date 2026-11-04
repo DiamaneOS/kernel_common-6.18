@@ -2053,15 +2053,14 @@ static struct config_group *gadgets_make(
 		goto out_free_driver_name;
 
 	if (android_device_create(&gi->cdev.android_opts))
-		goto out_free_driver_name_and_function;
+		goto out_free_function;
 
 	return &gi->group;
 
+out_free_function:
+	kfree(gi->composite.gadget_driver.function);
 out_free_driver_name:
 	kfree(gi->composite.gadget_driver.driver.name);
-out_free_driver_name_and_function:
-	kfree(gi->composite.gadget_driver.driver.name);
-	kfree(gi->composite.gadget_driver.function);
 err:
 	kfree(gi);
 	return ERR_PTR(-ENOMEM);
