@@ -429,8 +429,10 @@ void kasan_cache_create(struct kmem_cache *cache, unsigned int *size,
 	 * alloc meta to free up space for free meta.
 	 * This is only possible when slub_debug is disabled, as otherwise
 	 * the end of free meta will overlap with slub_debug metadata.
+	 * The slab canary is the word right after the object, so the end
+	 * of free meta would overwrite it.
 	 */
-	if (!__slub_debug_enabled()) {
+	if (!__slub_debug_enabled() && !IS_ENABLED(CONFIG_SLAB_CANARY)) {
 		rem_free_meta_size = sizeof(struct kasan_free_meta) -
 							cache->object_size;
 		*size += rem_free_meta_size;
