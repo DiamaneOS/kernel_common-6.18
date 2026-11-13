@@ -1330,6 +1330,16 @@ static void ext4_put_super(struct super_block *sb)
 		ext4_commit_super(sb);
 	}
 
+	/*
+	 * s_sb_upd_work sums the free counters in ext4_update_super(), so it
+	 * has to be done before they are destroyed. ext4_grp_locked_error()
+	 * queues it without looking at EXT4_MF_JOURNAL_DESTROY, and without a
+	 * journal nothing stops a later queueing either, so an error raised
+	 * since the flush above (ext4_mb_release() can raise one) may have
+	 * queued it again.
+	 */
+	flush_work(&sbi->s_sb_upd_work);
+
 	ext4_group_desc_free(sbi);
 	ext4_flex_groups_free(sbi);
 
@@ -5687,7 +5697,6 @@ failed_mount6:
 	ext4_mb_release(sb);
 	ext4_flex_groups_free(sbi);
 failed_mount5:
-	ext4_percpu_param_destroy(sbi);
 	ext4_ext_release(sb);
 	ext4_release_system_zone(sb);
 failed_mount4a:
@@ -5713,6 +5722,12 @@ failed_mount3a:
 failed_mount3:
 	/* flush s_sb_upd_work before sbi destroy */
 	flush_work(&sbi->s_sb_upd_work);
+	/*
+	 * The work sums the free counters in ext4_update_super(), and an error
+	 * during the mount can have queued it. So the counters go only now.
+	 * Destroying counters that were never set up does nothing.
+	 */
+	ext4_percpu_param_destroy(sbi);
 	ext4_stop_mmpd(sbi);
 	timer_delete_sync(&sbi->s_err_report);
 	ext4_group_desc_free(sbi);
