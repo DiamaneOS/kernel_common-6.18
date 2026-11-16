@@ -63,9 +63,11 @@ struct gunyah_rm_mem_share_req_mem_section {
 } __packed;
 
 /* Call: MEM_RELEASE */
+#define GUNYAH_RM_MEM_RECLAIM_FLAG_SANITIZE BIT(0)
+
 struct gunyah_rm_mem_release_req {
 	__le32 mem_handle;
-	u8 flags; /* currently not used */
+	u8 flags;
 	u8 _padding0;
 	__le16 _padding1;
 } __packed;
@@ -333,6 +335,14 @@ int gunyah_rm_mem_reclaim(struct gunyah_rm *rm,
 		.mem_handle = cpu_to_le32(parcel->mem_handle),
 	};
 	int ret;
+
+	/*
+	 * Memory lent before start (one ACL entry, the VM's) held the VM's
+	 * data. Ask the resource manager to scrub it before the host gets it
+	 * back, whatever its default for the VM.
+	 */
+	if (IS_ENABLED(CONFIG_GUNYAH_LEND_UPFRONT) && parcel->n_acl_entries == 1)
+		req.flags = GUNYAH_RM_MEM_RECLAIM_FLAG_SANITIZE;
 
 	ret = gunyah_rm_call(rm, GUNYAH_RM_RPC_MEM_RECLAIM, &req, sizeof(req),
 			     NULL, NULL);
