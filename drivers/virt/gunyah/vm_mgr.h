@@ -157,6 +157,9 @@ struct gunyah_vm {
 		struct gunyah_vm_parcel parcel;
 	} fw;
 	struct xarray boot_context;
+	/* GUNYAH_LEND_UPFRONT: the bindings lent or shared before start, besides the config image's */
+	struct gunyah_vm_parcel *upfront_parcels;
+	u32 n_upfront_parcels;
 };
 
 int gunyah_vm_mmio_write(struct gunyah_vm *ghvm, u64 addr, u32 len, u64 data);
