@@ -110,6 +110,8 @@ static long gunyah_vm_set_auth_type(struct gunyah_vm *ghvm,
 
 static int gunyah_generic_pre_vm_configure(struct gunyah_vm *ghvm)
 {
+	struct gunyah_vm_binding *b;
+
 	/*
 	 * VMs use dtb mem parcel as the config image parcel as they
 	 * don't have any explicit auth image/metadata
@@ -117,6 +119,20 @@ static int gunyah_generic_pre_vm_configure(struct gunyah_vm *ghvm)
 
 	ghvm->config_image.parcel.start = gunyah_gpa_to_gfn(ghvm->dtb.config.guest_phys_addr);
 	ghvm->config_image.parcel.pages = gunyah_gpa_to_gfn(ghvm->dtb.config.size);
+
+	/*
+	 * Without demand paging the whole binding that holds the DTB is the
+	 * config image parcel, so all of it is lent before the VM starts.
+	 */
+	if (IS_ENABLED(CONFIG_GUNYAH_LEND_UPFRONT)) {
+		down_read(&ghvm->bindings_lock);
+		b = mtree_load(&ghvm->bindings, ghvm->config_image.parcel.start);
+		if (b) {
+			ghvm->config_image.parcel.start = gunyah_gpa_to_gfn(b->guest_phys_addr);
+			ghvm->config_image.parcel.pages = gunyah_gpa_to_gfn(b->size);
+		}
+		up_read(&ghvm->bindings_lock);
+	}
 
 	ghvm->config_image.image_offset = 0;
 	ghvm->config_image.image_size = 0;
@@ -126,9 +142,67 @@ static int gunyah_generic_pre_vm_configure(struct gunyah_vm *ghvm)
 	return 0;
 }
 
+/*
+ * GUNYAH_LEND_UPFRONT: lend or share every binding before the VM starts,
+ * besides the config image's and the firmware's, which gunyah_vm_start()
+ * shares itself. Each stays a parcel and is reclaimed with the others when
+ * the VM goes away.
+ */
+static int gunyah_vm_lend_upfront(struct gunyah_vm *ghvm)
+{
+	u64 config_start = ghvm->config_image.parcel.start;
+	struct gunyah_vm_binding *b;
+	unsigned long gfn = 0;
+	u64 (*ranges)[2];
+	u32 n = 0, i;
+	int ret = 0;
+
+	down_read(&ghvm->bindings_lock);
+	mt_for_each(&ghvm->bindings, b, gfn, ULONG_MAX)
+		n++;
+	ranges = kcalloc(n ?: 1, sizeof(*ranges), GFP_KERNEL);
+	ghvm->upfront_parcels = kcalloc(n ?: 1, sizeof(*ghvm->upfront_parcels),
+					GFP_KERNEL_ACCOUNT);
+	if (!ranges || !ghvm->upfront_parcels) {
+		up_read(&ghvm->bindings_lock);
+		kfree(ranges);
+		return -ENOMEM;
+	}
+	n = 0;
+	gfn = 0;
+	mt_for_each(&ghvm->bindings, b, gfn, ULONG_MAX) {
+		if (gunyah_gpa_to_gfn(b->guest_phys_addr) == config_start)
+			continue;
+		if (ghvm->fw.config.size > 0 &&
+		    b->guest_phys_addr == ghvm->fw.config.guest_phys_addr)
+			continue;
+		ranges[n][0] = gunyah_gpa_to_gfn(b->guest_phys_addr);
+		ranges[n][1] = gunyah_gpa_to_gfn(b->size);
+		n++;
+	}
+	up_read(&ghvm->bindings_lock);
+
+	for (i = 0; i < n; i++) {
+		u64 start = ranges[i][0], pages = ranges[i][1];
+
+		ret = gunyah_share_parcel(ghvm, &ghvm->upfront_parcels[i], &start, &pages);
+		if (ret) {
+			dev_warn(ghvm->parent, "Failed to lend memory at %llx before start: %d\n",
+				 ranges[i][0], ret);
+			break;
+		}
+		ghvm->n_upfront_parcels++;
+	}
+	kfree(ranges);
+	return ret;
+}
+
 static int gunyah_generic_pre_vm_init(struct gunyah_vm *ghvm)
 {
 	int ret;
+
+	if (IS_ENABLED(CONFIG_GUNYAH_LEND_UPFRONT))
+		return gunyah_vm_lend_upfront(ghvm);
 
 	ret = gunyah_setup_demand_paging(ghvm, 0, ULONG_MAX);
 	if (ret) {
@@ -152,13 +226,16 @@ static int gunyah_generic_pre_vm_init(struct gunyah_vm *ghvm)
 
 static int gunyah_generic_pre_vm_start(struct gunyah_vm *ghvm)
 {
-	int ret;
+	int ret = 0;
 
-	ret = gunyah_vm_parcel_to_paged(ghvm, &ghvm->config_image.parcel.parcel,
-				ghvm->config_image.parcel.start,
-				ghvm->config_image.parcel.pages);
-	if (ret)
-		return ret;
+	/* Without demand paging the config image stays a parcel. */
+	if (!IS_ENABLED(CONFIG_GUNYAH_LEND_UPFRONT)) {
+		ret = gunyah_vm_parcel_to_paged(ghvm, &ghvm->config_image.parcel.parcel,
+					ghvm->config_image.parcel.start,
+					ghvm->config_image.parcel.pages);
+		if (ret)
+			return ret;
+	}
 
 	if (ghvm->auth != GUNYAH_RM_VM_AUTH_NONE)
 		return ret;
@@ -1193,6 +1270,9 @@ static void _gunyah_vm_put(struct kref *kref)
 	}
 
 	WARN_ON(gunyah_reclaim_parcels(ghvm, 0, ULONG_MAX));
+	kfree(ghvm->upfront_parcels);
+	ghvm->upfront_parcels = NULL;
+	ghvm->n_upfront_parcels = 0;
 	down_write(&ghvm->bindings_lock);
 	mt_for_each(&ghvm->bindings, b, index, ULONG_MAX) {
 		mtree_erase(&ghvm->bindings, gunyah_gpa_to_gfn(b->guest_phys_addr));
