@@ -143,7 +143,7 @@ static int gunyah_generic_pre_vm_configure(struct gunyah_vm *ghvm)
 }
 
 /*
- * GUNYAH_LEND_UPFRONT: lend or share every binding before the VM starts,
+ * GUNYAH_LEND_UPFRONT: lend or share every binding before VM_CONFIGURE,
  * besides the config image's and the firmware's, which gunyah_vm_start()
  * shares itself. Each stays a parcel and is reclaimed with the others when
  * the VM goes away.
@@ -201,8 +201,9 @@ static int gunyah_generic_pre_vm_init(struct gunyah_vm *ghvm)
 {
 	int ret;
 
+	/* gunyah_vm_start() lent the memory before VM_CONFIGURE. */
 	if (IS_ENABLED(CONFIG_GUNYAH_LEND_UPFRONT))
-		return gunyah_vm_lend_upfront(ghvm);
+		return 0;
 
 	ret = gunyah_setup_demand_paging(ghvm, 0, ULONG_MAX);
 	if (ret) {
@@ -939,6 +940,18 @@ static int gunyah_vm_start(struct gunyah_vm *ghvm)
 		dev_warn(ghvm->parent,
 			 "Failed to allocate parcel for the config image: %d\n", ret);
 		goto err;
+	}
+
+	/*
+	 * Lend the rest of the memory while the VM is still in LOAD. A VM that
+	 * fails between VM_CONFIGURE and VM_INIT can be neither reset nor
+	 * deleted, so its VMID would be lost until the next boot.
+	 */
+	if (IS_ENABLED(CONFIG_GUNYAH_LEND_UPFRONT) &&
+	    ghvm->auth_vm_mgr_ops == &generic_vm_ops) {
+		ret = gunyah_vm_lend_upfront(ghvm);
+		if (ret)
+			goto err;
 	}
 
 	ret = gunyah_rm_vm_configure(ghvm->rm, ghvm->vmid, ghvm->auth,
