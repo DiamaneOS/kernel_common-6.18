@@ -24,6 +24,22 @@ config GUNYAH
 	  Say Y/M here to enable the drivers needed to interact in a Gunyah
 	  virtual environment.
 
+config GUNYAH_LEND_UPFRONT
+	bool "Lend all VM memory before the VM starts"
+	depends on GUNYAH
+	help
+	  Older Gunyah resource managers implement neither demand paging
+	  (VM_SET_DEMAND_PAGING) nor VM_SET_ADDRESS_LAYOUT. They expect all
+	  memory of a VM to be lent or shared before it starts, as the Linux
+	  6.1 driver did. Qualcomm firmware for devices that launched with
+	  Linux 6.1, such as SM7635, has such a resource manager.
+
+	  With this option the binding that holds the DTB is the config image
+	  parcel, every other binding is lent or shared before the VM starts,
+	  and the memory is reclaimed as parcels when the VM goes away.
+
+	  Say N unless the resource manager lacks demand paging.
+
 config GUNYAH_PLATFORM_HOOKS
 	tristate
 
