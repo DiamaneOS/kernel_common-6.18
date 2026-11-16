@@ -537,7 +537,7 @@ static int gunyah_gup_share_parcel(struct gunyah_vm *ghvm,
 	unsigned long i, offset, entries, entry_size, tail_unpins = 0;
 
 	offset = gunyah_gfn_to_gpa(*gfn) - b->guest_phys_addr;
-	pages = kcalloc(*nr, sizeof(*pages), GFP_KERNEL_ACCOUNT);
+	pages = kvcalloc(*nr, sizeof(*pages), GFP_KERNEL_ACCOUNT);
 	if (!pages)
 		return -ENOMEM;
 
@@ -560,7 +560,7 @@ static int gunyah_gup_share_parcel(struct gunyah_vm *ghvm,
 		goto unpin_pages;
 
 	/* overallocate & assume no large folios */
-	parcel->mem_entries = kcalloc(pinned, sizeof(parcel->mem_entries[0]),
+	parcel->mem_entries = kvcalloc(pinned, sizeof(parcel->mem_entries[0]),
 					GFP_KERNEL_ACCOUNT);
 	if (!parcel->mem_entries) {
 		ret = -ENOMEM;
@@ -604,7 +604,7 @@ static int gunyah_gup_share_parcel(struct gunyah_vm *ghvm,
 	goto free_pages;
 
 free_mem_entries:
-	kfree(parcel->mem_entries);
+	kvfree(parcel->mem_entries);
 	parcel->mem_entries = NULL;
 	parcel->n_mem_entries = 0;
 unaccount_pages:
@@ -612,7 +612,7 @@ unaccount_pages:
 unpin_pages:
 	unpin_user_pages(pages, pinned);
 free_pages:
-	kfree(pages);
+	kvfree(pages);
 	return ret;
 }
 
@@ -790,7 +790,7 @@ static int gunyah_gup_reclaim_parcel(struct gunyah_vm *ghvm,
 	}
 
 	parcel->mem_handle = GUNYAH_MEM_HANDLE_INVAL;
-	kfree(parcel->mem_entries);
+	kvfree(parcel->mem_entries);
 	kfree(parcel->acl_entries);
 	vm_parcel->start = 0;
 	vm_parcel->pages = 0;
