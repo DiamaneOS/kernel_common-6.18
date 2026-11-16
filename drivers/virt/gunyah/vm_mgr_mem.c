@@ -525,6 +525,13 @@ unlock:
 }
 EXPORT_SYMBOL_GPL(gunyah_demand_page);
 
+/*
+ * Each physically separate range of a parcel is one entry. The FP6 resource
+ * manager refused VMs of 20000 to 23000 pieces cleanly at VM_START, and the
+ * lend of a 1536 MiB VM never returned. Refuse a larger parcel before it is sent.
+ */
+#define GUNYAH_LEND_MAX_PIECES 20480
+
 static int gunyah_gup_share_parcel(struct gunyah_vm *ghvm,
 			struct gunyah_vm_parcel *vm_parcel,
 			struct gunyah_vm_binding *b, u64 *gfn, u64 *nr)
@@ -594,7 +601,18 @@ static int gunyah_gup_share_parcel(struct gunyah_vm *ghvm,
 	}
 	parcel->mem_entries[entries].size = entry_size;
 	parcel->n_mem_entries = entries + 1;
+	if (IS_ENABLED(CONFIG_GUNYAH_LEND_UPFRONT) &&
+	    parcel->n_mem_entries > GUNYAH_LEND_MAX_PIECES) {
+		dev_warn(ghvm->parent,
+			 "VM memory at gfn %llx is in %zu pieces, more than %d: not lent\n",
+			 *gfn, parcel->n_mem_entries, GUNYAH_LEND_MAX_PIECES);
+		ret = -ENOMEM;
+		goto free_mem_entries;
+	}
 	ret = gunyah_rm_mem_share(ghvm->rm, parcel);
+	dev_dbg(ghvm->parent, "%s gfn %llx: %llu pages in %zu pieces, ret %d\n",
+		parcel->n_acl_entries == 1 ? "lend" : "share", *gfn, *nr,
+		parcel->n_mem_entries, ret);
 	if (ret)
 		goto free_mem_entries;
 
