@@ -37,9 +37,9 @@ config GUNYAH_LEND_UPFRONT
 	  With this option the binding that holds the DTB is the config image
 	  parcel, every other binding is lent or shared before the VM starts,
 	  and the memory is reclaimed as parcels when the VM goes away. A
-	  parcel in more than 20480 physically separate pieces is not lent:
-	  such a resource manager refuses or stalls on it. Back VM memory
-	  with huge pages to keep the pieces few.
+	  parcel that would take a VM above 20000 physically separate pieces
+	  in all its parcels is not lent: such a resource manager refuses or
+	  stalls on it. Back VM memory with huge pages to keep the pieces few.
 
 	  Say N unless the resource manager lacks demand paging.
 
