@@ -881,10 +881,28 @@ out:
 	return ret;
 }
 
+/*
+ * The resource manager deletes a VM only in its LOAD or RESET state, and resets
+ * only one in READY, INIT_FAILED or EXITED. VM_CONFIGURE moves the VM out of
+ * LOAD, so a start that fails before VM_INIT would leave the VMID allocated
+ * until the next boot. Send VM_INIT anyway: the VM ends in READY or
+ * INIT_FAILED, which gunyah_vm_put() resets before it frees the VMID.
+ */
+static void gunyah_vm_init_for_teardown(struct gunyah_vm *ghvm)
+{
+	int ret = gunyah_rm_vm_init(ghvm->rm, ghvm->vmid);
+
+	ghvm->vm_status = ret ? GUNYAH_RM_VM_STATUS_INIT_FAILED :
+				GUNYAH_RM_VM_STATUS_READY;
+	dev_info(ghvm->parent, "VM %u failed after VM_CONFIGURE, VM_INIT for teardown: %d\n",
+		 ghvm->vmid, ret);
+}
+
 static int gunyah_vm_start(struct gunyah_vm *ghvm)
 {
 	struct gunyah_rm_hyp_resources *resources = NULL;
 	struct gunyah_resource *ghrsc;
+	bool configured = false;
 	int ret, i, n;
 	u16 vmid = 0;
 
@@ -964,6 +982,7 @@ static int gunyah_vm_start(struct gunyah_vm *ghvm)
 		dev_warn(ghvm->parent, "Failed to configure VM: %d\n", ret);
 		goto err;
 	}
+	configured = true;
 
 	ret = gunyah_vm_authenticate(ghvm);
 	if (ret)
@@ -1036,6 +1055,8 @@ err_dealloc_vmid:
 err_rm_notifier_unregister:
 	gunyah_rm_notifier_unregister(ghvm->rm, &ghvm->nb);
 err:
+	if (configured && ghvm->vm_status == GUNYAH_RM_VM_STATUS_LOAD)
+		gunyah_vm_init_for_teardown(ghvm);
 	/* gunyah_vm_free will handle releasing resources and reclaiming memory */
 	gunyah_vm_start_fail(ghvm);
 	up_write(&ghvm->status_lock);
