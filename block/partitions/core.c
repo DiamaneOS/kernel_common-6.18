@@ -441,6 +441,16 @@ int bdev_add_partition(struct gendisk *disk, int partno, sector_t start,
 		goto out;
 	}
 
+	if (disk->flags & GENHD_FL_USER_PART) {
+		unsigned long idx = 1;
+
+		/* Userspace adds one partition at a time on such a disk. */
+		if (xa_find(&disk->part_tbl, &idx, ULONG_MAX, XA_PRESENT)) {
+			ret = -EBUSY;
+			goto out;
+		}
+	}
+
 	if (partition_overlaps(disk, start, length, -1)) {
 		ret = -EBUSY;
 		goto out;

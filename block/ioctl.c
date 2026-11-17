@@ -58,6 +58,9 @@ static int blkpg_do_ioctl(struct block_device *bdev,
 	case BLKPG_ADD_PARTITION:
 		return bdev_add_partition(disk, p.pno, start, length);
 	case BLKPG_RESIZE_PARTITION:
+		/* Userspace checked the range it added. It stays as it is. */
+		if (disk->flags & GENHD_FL_USER_PART)
+			return -EINVAL;
 		return bdev_resize_partition(disk, p.pno, start, length);
 	default:
 		return -EINVAL;

@@ -4,6 +4,19 @@
 #
 menu "Partition Types"
 
+config BLK_NO_EXTERNAL_PART_SCAN
+	bool "Do not read partition tables of SD cards and USB disks"
+	help
+	  The kernel reads the partition table of a disk as soon as it
+	  appears, before userspace decides whether to use it. With this
+	  option it does not do so for SD memory cards and for disks behind
+	  USB, and refuses requests to rescan them. Userspace gets the whole
+	  disk and can parse the table in an isolated process or VM. It may
+	  then add one partition at a time with BLKPG, at a range it checked
+	  itself. Internal storage keeps its partitions.
+
+	  If unsure, say N.
+
 config PARTITION_ADVANCED
 	bool "Advanced partition selection"
 	help

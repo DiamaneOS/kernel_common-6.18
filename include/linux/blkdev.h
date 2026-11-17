@@ -84,11 +84,18 @@ struct partition_meta_info {
  * ``GENHD_FL_NO_PART``: partition support is disabled.  The kernel will not
  * scan for partitions from add_disk, and users can't add partitions manually.
  *
+ * ``GENHD_FL_USER_PART``: the kernel never reads the partition table of this
+ * disk (removable media from an untrusted source).  It does not scan when the
+ * disk appears or its media changes, and BLKRRPART is refused.  A caller with
+ * CAP_SYS_ADMIN may add one partition at a time with BLKPG, at a range it read
+ * and checked itself, and delete it again.  Resizing it is refused.
+ *
  */
 enum {
 	GENHD_FL_REMOVABLE			= 1 << 0,
 	GENHD_FL_HIDDEN				= 1 << 1,
 	GENHD_FL_NO_PART			= 1 << 2,
+	GENHD_FL_USER_PART			= 1 << 3,
 };
 
 enum {
@@ -253,7 +260,8 @@ static inline unsigned int disk_openers(struct gendisk *disk)
  */
 static inline bool disk_has_partscan(struct gendisk *disk)
 {
-	return !(disk->flags & (GENHD_FL_NO_PART | GENHD_FL_HIDDEN)) &&
+	return !(disk->flags & (GENHD_FL_NO_PART | GENHD_FL_HIDDEN |
+				GENHD_FL_USER_PART)) &&
 		!test_bit(GD_SUPPRESS_PART_SCAN, &disk->state);
 }
 
