@@ -847,8 +847,9 @@ int gunyah_reclaim_parcels(struct gunyah_vm *ghvm, u64 start_gfn,
 	int ret, ret2 = 0;
 
 	mt_for_each(&ghvm->bindings, b, gfn, end_gfn) {
-		if (b->vm_parcel)
-			ret = gunyah_reclaim_parcel(ghvm, b->vm_parcel);
+		if (!b->vm_parcel)
+			continue;
+		ret = gunyah_reclaim_parcel(ghvm, b->vm_parcel);
 		if (ret)
 			ret2 = ret;
 	}
