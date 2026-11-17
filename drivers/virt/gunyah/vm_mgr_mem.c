@@ -526,11 +526,13 @@ unlock:
 EXPORT_SYMBOL_GPL(gunyah_demand_page);
 
 /*
- * Each physically separate range of a parcel is one entry. The FP6 resource
- * manager refused VMs of 20000 to 23000 pieces cleanly at VM_START, and the
- * lend of a 1536 MiB VM never returned. Refuse a larger parcel before it is sent.
+ * Each physically separate range of a parcel is one entry, and the limit is
+ * per VM: the FP6 resource manager refused VM_START for VMs of 20186 and
+ * 22897 pieces in all their parcels and started one of 18546, and the lend of
+ * a 1536 MiB VM never returned. Refuse a parcel that would take the VM above
+ * the limit before it is sent.
  */
-#define GUNYAH_LEND_MAX_PIECES 20480
+#define GUNYAH_LEND_MAX_PIECES 20000
 
 static int gunyah_gup_share_parcel(struct gunyah_vm *ghvm,
 			struct gunyah_vm_parcel *vm_parcel,
@@ -602,11 +604,13 @@ static int gunyah_gup_share_parcel(struct gunyah_vm *ghvm,
 	parcel->mem_entries[entries].size = entry_size;
 	parcel->n_mem_entries = entries + 1;
 	if (IS_ENABLED(CONFIG_GUNYAH_LEND_UPFRONT) &&
-	    parcel->n_mem_entries > GUNYAH_LEND_MAX_PIECES) {
+	    ghvm->lent_pieces + parcel->n_mem_entries > GUNYAH_LEND_MAX_PIECES) {
 		dev_warn(ghvm->parent,
-			 "VM memory at gfn %llx is in %zu pieces, more than %d: not lent\n",
-			 *gfn, parcel->n_mem_entries, GUNYAH_LEND_MAX_PIECES);
-		ret = -ENOMEM;
+			 "VM memory at gfn %llx is in %zu pieces, %zu for the whole VM, more than %d: not lent\n",
+			 *gfn, parcel->n_mem_entries,
+			 ghvm->lent_pieces + parcel->n_mem_entries,
+			 GUNYAH_LEND_MAX_PIECES);
+		ret = -E2BIG;
 		goto free_mem_entries;
 	}
 	ret = gunyah_rm_mem_share(ghvm->rm, parcel);
@@ -615,6 +619,8 @@ static int gunyah_gup_share_parcel(struct gunyah_vm *ghvm,
 		parcel->n_mem_entries, ret);
 	if (ret)
 		goto free_mem_entries;
+	if (IS_ENABLED(CONFIG_GUNYAH_LEND_UPFRONT))
+		ghvm->lent_pieces += parcel->n_mem_entries;
 
 	vm_parcel->start = *gfn;
 	vm_parcel->pages = *nr;
@@ -807,6 +813,9 @@ static int gunyah_gup_reclaim_parcel(struct gunyah_vm *ghvm,
 		}
 	}
 
+	if (IS_ENABLED(CONFIG_GUNYAH_LEND_UPFRONT))
+		ghvm->lent_pieces -= min_t(u32, ghvm->lent_pieces,
+					   parcel->n_mem_entries);
 	parcel->mem_handle = GUNYAH_MEM_HANDLE_INVAL;
 	kvfree(parcel->mem_entries);
 	kfree(parcel->acl_entries);
