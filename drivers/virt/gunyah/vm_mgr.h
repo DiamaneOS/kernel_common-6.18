@@ -160,6 +160,8 @@ struct gunyah_vm {
 	/* GUNYAH_LEND_UPFRONT: the bindings lent or shared before start, besides the config image's */
 	struct gunyah_vm_parcel *upfront_parcels;
 	u32 n_upfront_parcels;
+	/* GUNYAH_LEND_UPFRONT: physically separate pieces in all parcels lent or shared to this VM */
+	u32 lent_pieces;
 };
 
 int gunyah_vm_mmio_write(struct gunyah_vm *ghvm, u64 addr, u32 len, u64 data);
