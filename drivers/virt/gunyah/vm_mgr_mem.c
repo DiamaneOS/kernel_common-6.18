@@ -634,7 +634,14 @@ free_mem_entries:
 unaccount_pages:
 	account_locked_vm(current->mm, pinned - tail_unpins, false);
 unpin_pages:
-	unpin_user_pages(pages, pinned);
+	/*
+	 * The tail pages of large folios were unpinned above and their slots
+	 * set to NULL. unpin_user_pages() only skips a NULL that starts a run,
+	 * so unpin what is left page by page.
+	 */
+	for (i = 0; i < pinned; i++)
+		if (pages[i])
+			unpin_user_page(pages[i]);
 free_pages:
 	kvfree(pages);
 	return ret;
