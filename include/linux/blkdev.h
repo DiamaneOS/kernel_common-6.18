@@ -258,6 +258,9 @@ static inline unsigned int disk_openers(struct gendisk *disk)
  * Returns %true if partitions scanning is enabled for @disk, or %false if
  * partition scanning is disabled either permanently or temporarily.
  */
+/* CONFIG_BLK_NO_EXTERNAL_PART_SCAN: external_part_scan=1 on the command line, block/genhd.c */
+extern bool blk_external_part_scan;
+
 static inline bool disk_has_partscan(struct gendisk *disk)
 {
 	return !(disk->flags & (GENHD_FL_NO_PART | GENHD_FL_HIDDEN |

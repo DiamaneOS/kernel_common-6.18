@@ -901,6 +901,11 @@ static int
 loop_set_status_from_info(struct loop_device *lo,
 			  const struct loop_info64 *info)
 {
+	/* The file behind a loop device may come from anyone: its table is never read. */
+	if (IS_ENABLED(CONFIG_BLK_NO_EXTERNAL_PART_SCAN) &&
+	    (info->lo_flags & LO_FLAGS_PARTSCAN))
+		return -EINVAL;
+
 	if ((unsigned int) info->lo_encrypt_key_size > LO_KEY_SIZE)
 		return -EINVAL;
 
@@ -2236,6 +2241,10 @@ static int __init loop_init(void)
 	int err;
 
 	part_shift = 0;
+	if (IS_ENABLED(CONFIG_BLK_NO_EXTERNAL_PART_SCAN) && max_part > 0) {
+		pr_info("loop: max_part ignored, partition tables are never read\n");
+		max_part = 0;
+	}
 	if (max_part > 0) {
 		part_shift = fls(max_part);
 

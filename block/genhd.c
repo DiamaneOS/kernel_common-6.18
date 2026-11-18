@@ -1019,6 +1019,15 @@ static ssize_t disk_range_show(struct device *dev,
 	return sysfs_emit(buf, "%d\n", disk->minors);
 }
 
+#ifdef CONFIG_BLK_NO_EXTERNAL_PART_SCAN
+/*
+ * external_part_scan=1 on the command line restores the partition scan of SD
+ * cards and USB disks, for a userspace that does not read their tables itself.
+ */
+bool blk_external_part_scan;
+core_param(external_part_scan, blk_external_part_scan, bool, 0444);
+#endif
+
 static ssize_t disk_ext_range_show(struct device *dev,
 				   struct device_attribute *attr, char *buf)
 {

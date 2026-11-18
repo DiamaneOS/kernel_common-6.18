@@ -4027,7 +4027,8 @@ static int sd_probe(struct device *dev)
 		gd->events |= DISK_EVENT_MEDIA_CHANGE;
 		gd->event_flags = DISK_EVENT_FLAG_POLL | DISK_EVENT_FLAG_UEVENT;
 	}
-	if (IS_ENABLED(CONFIG_BLK_NO_EXTERNAL_PART_SCAN) && sd_behind_usb(sdp))
+	if (IS_ENABLED(CONFIG_BLK_NO_EXTERNAL_PART_SCAN) && !blk_external_part_scan &&
+	    sd_behind_usb(sdp))
 		gd->flags |= GENHD_FL_USER_PART;
 
 	blk_pm_runtime_init(sdp->request_queue, dev);
