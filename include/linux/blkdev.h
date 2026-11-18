@@ -86,7 +86,8 @@ struct partition_meta_info {
  *
  * ``GENHD_FL_USER_PART``: the kernel never reads the partition table of this
  * disk (removable media from an untrusted source).  It does not scan when the
- * disk appears or its media changes, and BLKRRPART is refused.  A caller with
+ * disk appears or its media changes, and BLKRRPART is refused.  Partitions
+ * userspace added go with the old medium on a media change.  A caller with
  * CAP_SYS_ADMIN may add two partitions at a time with BLKPG, at ranges it read
  * and checked itself, and delete it again.  Resizing it is refused.
  *

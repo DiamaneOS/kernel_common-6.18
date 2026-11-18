@@ -668,15 +668,6 @@ int bdev_disk_changed(struct gendisk *disk, bool invalidate)
 	if (!disk_live(disk))
 		return -ENXIO;
 
-	/*
-	 * Nothing is read on a disk whose table userspace reads. The partitions it
-	 * added stay while the medium is there, and go with the medium.
-	 */
-	if ((disk->flags & GENHD_FL_USER_PART) && !invalidate) {
-		clear_bit(GD_NEED_PART_SCAN, &disk->state);
-		return 0;
-	}
-
 rescan:
 	if (disk->open_partitions)
 		return -EBUSY;
@@ -716,6 +707,11 @@ rescan:
 			set_capacity(disk, 0);
 	}
 
+	/*
+	 * A disk whose table userspace reads (GENHD_FL_USER_PART): the partitions
+	 * it added went with the old medium above, as on any disk, and nothing is
+	 * read from the new one. blk_add_partitions() does not scan such a disk.
+	 */
 	if (get_capacity(disk)) {
 		ret = blk_add_partitions(disk);
 		if (ret == -EAGAIN)
