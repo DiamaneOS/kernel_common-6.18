@@ -443,11 +443,19 @@ int bdev_add_partition(struct gendisk *disk, int partno, sector_t start,
 
 	if (disk->flags & GENHD_FL_USER_PART) {
 		unsigned long idx = 1;
+		int added = 0;
 
-		/* Userspace adds one partition at a time on such a disk. */
-		if (xa_find(&disk->part_tbl, &idx, ULONG_MAX, XA_PRESENT)) {
-			ret = -EBUSY;
-			goto out;
+		/*
+		 * Userspace adds at most two partitions at a time on such a
+		 * disk: on a mixed card, the adoptable storage and the public
+		 * partition next to it.
+		 */
+		while (xa_find(&disk->part_tbl, &idx, ULONG_MAX, XA_PRESENT)) {
+			if (++added >= 2) {
+				ret = -EBUSY;
+				goto out;
+			}
+			idx++;
 		}
 	}
 

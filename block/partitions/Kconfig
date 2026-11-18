@@ -6,14 +6,15 @@ menu "Partition Types"
 
 config BLK_NO_EXTERNAL_PART_SCAN
 	bool "Do not read partition tables of SD cards and USB disks"
+	depends on BLK_DEV_SD != m && MMC_BLOCK != m
 	help
 	  The kernel reads the partition table of a disk as soon as it
 	  appears, before userspace decides whether to use it. With this
 	  option it does not do so for cards in removable MMC and SD slots
 	  and for disks behind USB, and refuses requests to rescan them.
 	  Userspace gets the whole disk and can parse the table in an
-	  isolated process or VM. It may then add one partition at a time
-	  with BLKPG, at a range it checked itself. Loop devices never get
+	  isolated process or VM. It may then add up to two partitions at
+	  a time with BLKPG, at ranges it checked itself. Loop devices never get
 	  their partition table read either: LO_FLAGS_PARTSCAN is refused
 	  and loop.max_part is ignored. Internal storage keeps its
 	  partitions. Booting with external_part_scan=1 restores the scan
