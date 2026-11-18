@@ -27,6 +27,7 @@ config GUNYAH
 config GUNYAH_LEND_UPFRONT
 	bool "Lend all VM memory before the VM starts"
 	depends on GUNYAH
+	select GENERIC_ALLOCATOR
 	help
 	  Older Gunyah resource managers implement neither demand paging
 	  (VM_SET_DEMAND_PAGING) nor VM_SET_ADDRESS_LAYOUT. They expect all
@@ -39,7 +40,13 @@ config GUNYAH_LEND_UPFRONT
 	  and the memory is reclaimed as parcels when the VM goes away. A
 	  parcel that would take a VM above 20000 physically separate pieces
 	  in all its parcels is not lent: such a resource manager refuses or
-	  stalls on it. Back VM memory with huge pages to keep the pieces few.
+	  stalls on it.
+
+	  To keep the pieces few however scattered memory gets, set memory
+	  aside at boot with reserve_mem=<size>:2M:gunyah_vm_pool. The driver
+	  then offers it as /dev/gunyah_vm_pool, in 2 MiB blocks, and lends it
+	  to protected VMs only. Nothing else allocates from it. Its size, free
+	  and lost bytes are in /sys/class/misc/gunyah_vm_pool/.
 
 	  Say N unless the resource manager lacks demand paging.
 
