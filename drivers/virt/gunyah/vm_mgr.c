@@ -1193,6 +1193,7 @@ static long gunyah_vm_ioctl(struct file *filp, unsigned int cmd,
 	}
 	case GH_VM_ANDROID_MAP_CMA_MEM: {
 		struct gunyah_map_cma_mem_args cma_mem;
+		struct file *file;
 
 		/* only allow owner task to add memory */
 		if (ghvm->mm_s != current->mm)
@@ -1201,7 +1202,16 @@ static long gunyah_vm_ioctl(struct file *filp, unsigned int cmd,
 		if (copy_from_user(&cma_mem, argp, sizeof(cma_mem)))
 			return -EFAULT;
 
-		r = gunyah_vm_binding_cma_alloc(ghvm, &cma_mem);
+		/* A file of the VM memory pool, else a CMA file. */
+		file = fget(cma_mem.guest_mem_fd);
+		if (!file)
+			return -EBADF;
+		if (gunyah_vm_pool_mem_file(file)) {
+			r = gunyah_vm_binding_pool_alloc(ghvm, &cma_mem, file);
+		} else {
+			fput(file);
+			r = gunyah_vm_binding_cma_alloc(ghvm, &cma_mem);
+		}
 		break;
 	}
 	case GUNYAH_VM_SET_BOOT_CONTEXT: {
@@ -1310,7 +1320,7 @@ static void _gunyah_vm_put(struct kref *kref)
 	down_write(&ghvm->bindings_lock);
 	mt_for_each(&ghvm->bindings, b, index, ULONG_MAX) {
 		mtree_erase(&ghvm->bindings, gunyah_gpa_to_gfn(b->guest_phys_addr));
-		if (b->mem_type == VM_MEM_CMA && b->cma.file)
+		if ((b->mem_type == VM_MEM_CMA || b->mem_type == VM_MEM_POOL) && b->cma.file)
 			fput(b->cma.file);
 		kfree(b);
 	}

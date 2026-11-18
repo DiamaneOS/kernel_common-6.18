@@ -27,9 +27,10 @@ struct gunyah_vm_parcel {
 };
 
 struct gunyah_vm_binding {
-	enum { VM_MEM_USER, VM_MEM_CMA } mem_type;
+	enum { VM_MEM_USER, VM_MEM_CMA, VM_MEM_POOL } mem_type;
 	union {
 		u64 userspace_addr;
+		/* VM_MEM_CMA and VM_MEM_POOL: the memory file and the offset in it */
 		struct {
 			struct file *file;
 			u64 offset;
@@ -248,6 +249,59 @@ int gunyah_demand_page(struct gunyah_vm *ghvm, u64 gpa, bool write);
 int gunyah_setup_demand_paging(struct gunyah_vm *ghvm, u64 start_gfn,
 				u64 end_gfn);
 int gunyah_vm_set_protected(struct gunyah_vm *ghvm);
+
+/*
+ * GUNYAH_LEND_UPFRONT: each physically separate range of a parcel is one
+ * entry, and the limit is per VM: the FP6 resource manager refused VM_START
+ * for VMs of 20186 and 22897 pieces in all their parcels and started one of
+ * 18546, and the lend of a 1536 MiB VM never returned. A parcel that would
+ * take the VM above the limit is refused before it is sent.
+ */
+#define GUNYAH_LEND_MAX_PIECES 20000
+
+#ifdef CONFIG_GUNYAH_LEND_UPFRONT
+int gunyah_vm_pool_init(void);
+void gunyah_vm_pool_exit(void);
+bool gunyah_vm_pool_mem_file(struct file *file);
+int gunyah_vm_binding_pool_alloc(struct gunyah_vm *ghvm,
+				 struct gunyah_map_cma_mem_args *args, struct file *file);
+int gunyah_vm_pool_share_parcel(struct gunyah_vm *ghvm, struct gunyah_vm_parcel *vm_parcel,
+				struct gunyah_vm_binding *b, u64 *gfn, u64 *nr);
+int gunyah_vm_pool_reclaim_parcel(struct gunyah_vm *ghvm, struct gunyah_vm_parcel *vm_parcel,
+				  struct gunyah_vm_binding *b);
+#else
+static inline int gunyah_vm_pool_init(void)
+{
+	return 0;
+}
+static inline void gunyah_vm_pool_exit(void)
+{
+}
+static inline bool gunyah_vm_pool_mem_file(struct file *file)
+{
+	return false;
+}
+static inline int gunyah_vm_binding_pool_alloc(struct gunyah_vm *ghvm,
+					       struct gunyah_map_cma_mem_args *args,
+					       struct file *file)
+{
+	fput(file);
+	return -EINVAL;
+}
+static inline int gunyah_vm_pool_share_parcel(struct gunyah_vm *ghvm,
+					      struct gunyah_vm_parcel *vm_parcel,
+					      struct gunyah_vm_binding *b, u64 *gfn, u64 *nr)
+{
+	return -EINVAL;
+}
+static inline int gunyah_vm_pool_reclaim_parcel(struct gunyah_vm *ghvm,
+						struct gunyah_vm_parcel *vm_parcel,
+						struct gunyah_vm_binding *b)
+{
+	return -EINVAL;
+}
+#endif
+
 #ifdef CONFIG_DMA_CMA
 int gunyah_cma_mem_init(void);
 void gunyah_cma_mem_exit(void);

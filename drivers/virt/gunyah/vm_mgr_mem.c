@@ -512,8 +512,8 @@ int gunyah_demand_page(struct gunyah_vm *ghvm, u64 gpa, bool write)
 		goto unlock;
 	}
 
-	if (b->mem_type == VM_MEM_CMA) {
-		dev_warn(ghvm->parent, "Demand paging of CMA mem not supported\n");
+	if (b->mem_type != VM_MEM_USER) {
+		dev_warn(ghvm->parent, "Demand paging of CMA or pool mem not supported\n");
 		ret = -EOPNOTSUPP;
 	} else {
 		ret = gunyah_gup_demand_page(ghvm, b, gpa, write);
@@ -524,15 +524,6 @@ unlock:
 	return ret;
 }
 EXPORT_SYMBOL_GPL(gunyah_demand_page);
-
-/*
- * Each physically separate range of a parcel is one entry, and the limit is
- * per VM: the FP6 resource manager refused VM_START for VMs of 20186 and
- * 22897 pieces in all their parcels and started one of 18546, and the lend of
- * a 1536 MiB VM never returned. Refuse a parcel that would take the VM above
- * the limit before it is sent.
- */
-#define GUNYAH_LEND_MAX_PIECES 20000
 
 static int gunyah_gup_share_parcel(struct gunyah_vm *ghvm,
 			struct gunyah_vm_parcel *vm_parcel,
@@ -614,9 +605,15 @@ static int gunyah_gup_share_parcel(struct gunyah_vm *ghvm,
 		goto free_mem_entries;
 	}
 	ret = gunyah_rm_mem_share(ghvm->rm, parcel);
-	dev_dbg(ghvm->parent, "%s gfn %llx: %llu pages in %zu pieces, ret %d\n",
-		parcel->n_acl_entries == 1 ? "lend" : "share", *gfn, *nr,
-		parcel->n_mem_entries, ret);
+	if (IS_ENABLED(CONFIG_GUNYAH_LEND_UPFRONT))
+		dev_info(ghvm->parent, "%s gfn %llx: %llu pages in %zu pieces, %zu for the whole VM, ret %d\n",
+			 parcel->n_acl_entries == 1 ? "lend" : "share", *gfn, *nr,
+			 parcel->n_mem_entries,
+			 ghvm->lent_pieces + (ret ? 0 : parcel->n_mem_entries), ret);
+	else
+		dev_dbg(ghvm->parent, "%s gfn %llx: %llu pages in %zu pieces, ret %d\n",
+			parcel->n_acl_entries == 1 ? "lend" : "share", *gfn, *nr,
+			parcel->n_mem_entries, ret);
 	if (ret)
 		goto free_mem_entries;
 	if (IS_ENABLED(CONFIG_GUNYAH_LEND_UPFRONT))
@@ -709,6 +706,12 @@ int gunyah_share_parcel(struct gunyah_vm *ghvm, struct gunyah_vm_parcel *vm_parc
 		ret = gunyah_cma_share_parcel(ghvm, vm_parcel, b, gfn, nr);
 		if (ret) {
 			dev_warn(ghvm->parent, "Failed to share CMA memory: %d\n", ret);
+			goto free_acl;
+		}
+	} else if (b->mem_type == VM_MEM_POOL) {
+		ret = gunyah_vm_pool_share_parcel(ghvm, vm_parcel, b, gfn, nr);
+		if (ret) {
+			dev_warn(ghvm->parent, "Failed to lend pool memory: %d\n", ret);
 			goto free_acl;
 		}
 	} else {
@@ -847,6 +850,8 @@ static int gunyah_reclaim_parcel(struct gunyah_vm *ghvm,
 
 	if (b->mem_type == VM_MEM_CMA)
 		ret = gunyah_cma_reclaim_parcel(ghvm, vm_parcel, b);
+	else if (b->mem_type == VM_MEM_POOL)
+		ret = gunyah_vm_pool_reclaim_parcel(ghvm, vm_parcel, b);
 	else
 		ret = gunyah_gup_reclaim_parcel(ghvm, vm_parcel, b);
 

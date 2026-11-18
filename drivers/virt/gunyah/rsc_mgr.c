@@ -1068,6 +1068,10 @@ static int __init gunyah_rm_init(void)
 	if (ret)
 		pr_err("Failed to register gunyah CMA device\n");
 
+	ret = gunyah_vm_pool_init();
+	if (ret)
+		pr_err("Failed to set up the VM memory pool: %d\n", ret);
+
 	ret = gunyah_rm_sysfs_register(rm);
 	if (ret)
 		pr_err("Failed to setup RM log\n");
@@ -1094,6 +1098,7 @@ static void __exit gunyah_rm_exit(void)
 		return;
 
 	gunyah_rm_sysfs_unregister();
+	gunyah_vm_pool_exit();
 	gunyah_cma_mem_exit();
 	auxiliary_device_delete(&rm->adev);
 	misc_deregister(&rm->miscdev);
