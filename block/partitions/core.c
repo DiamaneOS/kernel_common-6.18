@@ -436,27 +436,13 @@ int bdev_add_partition(struct gendisk *disk, int partno, sector_t start,
 		goto out;
 	}
 
-	if (disk->flags & GENHD_FL_NO_PART) {
+	/*
+	 * Userspace serves the partitions of a GENHD_FL_USER_PART disk itself
+	 * (device-mapper ranges of it): the kernel adds none there either.
+	 */
+	if (disk->flags & (GENHD_FL_NO_PART | GENHD_FL_USER_PART)) {
 		ret = -EINVAL;
 		goto out;
-	}
-
-	if (disk->flags & GENHD_FL_USER_PART) {
-		unsigned long idx = 1;
-		int added = 0;
-
-		/*
-		 * Userspace adds at most two partitions at a time on such a
-		 * disk: on a mixed card, the adoptable storage and the public
-		 * partition next to it.
-		 */
-		while (xa_find(&disk->part_tbl, &idx, ULONG_MAX, XA_PRESENT)) {
-			if (++added >= 2) {
-				ret = -EBUSY;
-				goto out;
-			}
-			idx++;
-		}
 	}
 
 	if (partition_overlaps(disk, start, length, -1)) {
@@ -708,9 +694,9 @@ rescan:
 	}
 
 	/*
-	 * A disk whose table userspace reads (GENHD_FL_USER_PART): the partitions
-	 * it added went with the old medium above, as on any disk, and nothing is
-	 * read from the new one. blk_add_partitions() does not scan such a disk.
+	 * A disk whose table userspace reads (GENHD_FL_USER_PART) has no
+	 * partitions, and nothing is read from the new medium:
+	 * blk_add_partitions() does not scan such a disk.
 	 */
 	if (get_capacity(disk)) {
 		ret = blk_add_partitions(disk);
