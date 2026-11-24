@@ -2621,6 +2621,11 @@ static struct mmc_blk_data *mmc_blk_alloc_req(struct mmc_card *card,
 	set_disk_ro(md->disk, md->read_only || default_ro);
 	if (area_type & MMC_BLK_DATA_AREA_RPMB)
 		md->disk->flags |= GENHD_FL_NO_PART;
+	/* DiamaneOS: userspace reads the table of a removable card */
+	else if (IS_ENABLED(CONFIG_BLK_NO_EXTERNAL_PART_SCAN) &&
+		 (mmc_card_sd(card) || mmc_card_sd_combo(card) ||
+		  mmc_card_is_removable(card->host)))
+		md->disk->flags |= GENHD_FL_USER_PART;
 
 	/*
 	 * As discussed on lkml, GENHD_FL_REMOVABLE should:
