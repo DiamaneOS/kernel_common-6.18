@@ -64,6 +64,32 @@ config MMC_BLOCK_MINORS
 
 	  If unsure, say 8 here.
 
+# DiamaneOS: the system server sets the hold from the lock screen (sd_hold.c).
+config MMC_HOLD_NEW_CARDS
+	bool "Hold new cards on removable hosts until userspace allows them"
+	depends on MMC=y && SYSCTL
+	help
+	  The MMC core parses a new card's registers and replies in the
+	  kernel. With this option a card that appears on a removable host
+	  is left unpowered, without a single command, while the sysctl
+	  kernel.hold_new_sd is 1, and starts once it is cleared. Cards
+	  that already work and non-removable hosts are not affected.
+
+	  The hold is set at boot, so a kernel with this option starts no
+	  removable card until userspace clears it. Android devices set it
+	  from the lock screen state.
+
+	  If unsure, say N.
+
+config MMC_HOLD_NEW_CARDS_KUNIT_TEST
+	bool "KUnit test of the hold of new cards" if !KUNIT_ALL_TESTS
+	depends on MMC_HOLD_NEW_CARDS && KUNIT=y
+	default KUNIT_ALL_TESTS
+	help
+	  Tests the hold with fake hosts that count the commands they get.
+
+	  If unsure, say N.
+
 config SDIO_UART
 	tristate "SDIO UART/GPS class support"
 	depends on TTY

@@ -28,6 +28,7 @@
 #include "slot-gpio.h"
 #include "pwrseq.h"
 #include "sdio_ops.h"
+#include "sd_hold.h"
 
 #define cls_dev_to_mmc_host(d)	container_of(d, struct mmc_host, class_dev)
 
@@ -102,6 +103,14 @@ void mmc_unregister_host_class(void)
 {
 	class_unregister(&mmc_host_class);
 }
+
+#ifdef CONFIG_MMC_HOLD_NEW_CARDS
+/* DiamaneOS: sd_hold.c starts the cards it held on every host. */
+int mmc_for_each_host(int (*fn)(struct device *dev, void *data), void *data)
+{
+	return class_for_each_device(&mmc_host_class, NULL, data, fn);
+}
+#endif
 
 /**
  * mmc_retune_enable() - enter a transfer mode that requires retuning

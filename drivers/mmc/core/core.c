@@ -45,6 +45,7 @@
 #include "mmc_ops.h"
 #include "sd_ops.h"
 #include "sdio_ops.h"
+#include "sd_hold.h"
 
 /* The max erase timeout, used when host->max_busy_timeout isn't specified */
 #define MMC_ERASE_TIMEOUT_MS	(60 * 1000) /* 60 s */
@@ -2287,6 +2288,13 @@ void mmc_rescan(struct work_struct *work)
 		goto out;
 	}
 
+	/* DiamaneOS: no command to a new card while it is held (sd_hold.c). */
+	if (mmc_sd_hold_new_card(host)) {
+		mmc_power_off(host);
+		mmc_release_host(host);
+		goto out;
+	}
+
 	/* If an SD express card is present, then leave it as is. */
 	if (mmc_card_sd_express(host)) {
 		mmc_release_host(host);
@@ -2364,6 +2372,7 @@ void __mmc_stop_host(struct mmc_host *host)
 	}
 
 	host->rescan_disable = 1;
+	mmc_sd_hold_sync(); /* DiamaneOS: sd_hold.c */
 	cancel_delayed_work_sync(&host->detect);
 }
 
