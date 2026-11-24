@@ -27,6 +27,8 @@ config GUNYAH
 config GUNYAH_LEND_UPFRONT
 	bool "Lend all VM memory before the VM starts"
 	depends on GUNYAH
+	# DiamaneOS: the VM memory pool (vm_mgr_pool_mem.c)
+	select GENERIC_ALLOCATOR
 	help
 	  Older Gunyah resource managers implement neither demand paging
 	  (VM_SET_DEMAND_PAGING) nor VM_SET_ADDRESS_LAYOUT. They expect all
@@ -39,9 +41,29 @@ config GUNYAH_LEND_UPFRONT
 	  and the memory is reclaimed as parcels when the VM goes away. A
 	  parcel that would take a VM above 20000 physically separate pieces
 	  in all its parcels is not lent: such a resource manager refuses or
-	  stalls on it. Back VM memory with huge pages to keep the pieces few.
+	  stalls on it.
+
+	  To keep the pieces few however scattered memory gets, set memory
+	  aside at boot with reserve_mem=<size>:2M:gunyah_vm_pool. The driver
+	  then offers it as /dev/gunyah_vm_pool, in 2 MiB blocks, and lends it
+	  to protected VMs only. Nothing else allocates from it. Its size, free
+	  and lost bytes are in /sys/class/misc/gunyah_vm_pool/.
 
 	  Say N unless the resource manager lacks demand paging.
+
+config GUNYAH_CMA_MEM
+	bool "Gunyah VM memory from CMA regions"
+	depends on GUNYAH && DMA_CMA
+	# DiamaneOS: memory lent up front comes from the VM memory pool or
+	# ordinary pages, which count pieces and keep memory the hypervisor
+	# may hold out of use. The CMA backend does neither.
+	depends on !GUNYAH_LEND_UPFRONT
+	default y
+	help
+	  Lets a VM manager lend memory from a CMA region that the device
+	  tree names for Gunyah VMs (gunyah-cma-vm-mem).
+
+	  Say Y unless the device has no such region.
 
 config GUNYAH_PLATFORM_HOOKS
 	tristate
@@ -85,3 +107,17 @@ config GUNYAH_QCOM_TRUSTED_VM
 	  firmware.
 
 	  Say Y/M here if unsure and you want to support QTVMs.
+
+config GUNYAH_MEM_KUNIT_TEST
+	bool "KUnit test of who holds VM memory after a failure" if !KUNIT_ALL_TESTS
+	depends on KUNIT=y && !GUNYAH && MMU
+	select GENERIC_ALLOCATOR
+	default KUNIT_ALL_TESTS
+	help
+	  DiamaneOS: builds the Gunyah driver's memory code without the
+	  hypervisor, for UML, with a scripted resource manager and
+	  TrustZone. Memory the host may not own after a failed lend,
+	  rollback or reclaim must stay pinned or out of the VM memory pool,
+	  with its pieces still counted.
+
+	  If unsure, say N.
