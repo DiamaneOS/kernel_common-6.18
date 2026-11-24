@@ -436,7 +436,12 @@ int bdev_add_partition(struct gendisk *disk, int partno, sector_t start,
 		goto out;
 	}
 
-	if (disk->flags & GENHD_FL_NO_PART) {
+	/*
+	 * DiamaneOS: userspace serves the partitions of a GENHD_FL_USER_PART
+	 * disk itself (device-mapper ranges of it): the kernel adds none there
+	 * either.
+	 */
+	if (disk->flags & (GENHD_FL_NO_PART | GENHD_FL_USER_PART)) {
 		ret = -EINVAL;
 		goto out;
 	}
@@ -689,6 +694,11 @@ rescan:
 			set_capacity(disk, 0);
 	}
 
+	/*
+	 * DiamaneOS: a disk whose table userspace reads (GENHD_FL_USER_PART)
+	 * has no partitions, and nothing is read from the new medium:
+	 * blk_add_partitions() does not scan such a disk.
+	 */
 	if (get_capacity(disk)) {
 		ret = blk_add_partitions(disk);
 		if (ret == -EAGAIN)
