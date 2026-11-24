@@ -901,6 +901,14 @@ static int
 loop_set_status_from_info(struct loop_device *lo,
 			  const struct loop_info64 *info)
 {
+	/*
+	 * DiamaneOS: the file behind a loop device may come from anyone, its
+	 * table is never read.
+	 */
+	if (IS_ENABLED(CONFIG_BLK_NO_EXTERNAL_PART_SCAN) &&
+	    (info->lo_flags & LO_FLAGS_PARTSCAN))
+		return -EINVAL;
+
 	if ((unsigned int) info->lo_encrypt_key_size > LO_KEY_SIZE)
 		return -EINVAL;
 
@@ -2066,6 +2074,12 @@ static int loop_add(int i)
 	 */
 	if (!part_shift)
 		set_bit(GD_SUPPRESS_PART_SCAN, &disk->state);
+	/*
+	 * DiamaneOS: CONFIG_BLK_NO_EXTERNAL_PART_SCAN, a loop device has no
+	 * partitions at all: none read from its file, none added with BLKPG.
+	 */
+	if (IS_ENABLED(CONFIG_BLK_NO_EXTERNAL_PART_SCAN))
+		disk->flags |= GENHD_FL_NO_PART;
 	mutex_init(&lo->lo_mutex);
 	lo->lo_number		= i;
 	spin_lock_init(&lo->lo_lock);
@@ -2238,6 +2252,11 @@ static int __init loop_init(void)
 	int err;
 
 	part_shift = 0;
+	/* DiamaneOS: the same for max_part, CONFIG_BLK_NO_EXTERNAL_PART_SCAN */
+	if (IS_ENABLED(CONFIG_BLK_NO_EXTERNAL_PART_SCAN) && max_part > 0) {
+		pr_info("loop: max_part ignored, partition tables are never read\n");
+		max_part = 0;
+	}
 	if (max_part > 0) {
 		part_shift = fls(max_part);
 
@@ -2319,4 +2338,9 @@ static int __init max_loop_setup(char *str)
 }
 
 __setup("max_loop=", max_loop_setup);
+#endif
+
+/* DiamaneOS: loop devices get no partitions with CONFIG_BLK_NO_EXTERNAL_PART_SCAN */
+#ifdef CONFIG_BLK_DEV_LOOP_NO_PART_KUNIT_TEST
+#include "loop_no_part_test.c"
 #endif
