@@ -27,9 +27,11 @@ struct gunyah_vm_parcel {
 };
 
 struct gunyah_vm_binding {
-	enum { VM_MEM_USER, VM_MEM_CMA } mem_type;
+	/* DiamaneOS: VM_MEM_POOL, the VM memory pool set aside at boot */
+	enum { VM_MEM_USER, VM_MEM_CMA, VM_MEM_POOL } mem_type;
 	union {
 		u64 userspace_addr;
+		/* DiamaneOS: CMA and pool memory, the file and its offset */
 		struct {
 			struct file *file;
 			u64 offset;
@@ -37,6 +39,8 @@ struct gunyah_vm_binding {
 	};
 	struct gunyah_vm_parcel *vm_parcel;
 	enum { VM_MEM_SHARE, VM_MEM_LEND } share_type;
+	/* DiamaneOS: quarantine uses the existing alignment hole. */
+	ANDROID_KABI_IGNORE(1, bool quarantined);
 	u64 guest_phys_addr;
 	u64 size;
 	u32 flags;
@@ -164,6 +168,10 @@ struct gunyah_vm {
 	u32 lent_pieces;
 };
 
+/* DiamaneOS: quarantine must not move the next original member. */
+static_assert(offsetof(struct gunyah_vm_binding, guest_phys_addr) ==
+	      ALIGN(offsetof(struct gunyah_vm_binding, share_type) +
+		    sizeof_field(struct gunyah_vm_binding, share_type), __alignof__(u64)));
 int gunyah_vm_mmio_write(struct gunyah_vm *ghvm, u64 addr, u32 len, u64 data);
 
 /**
@@ -244,11 +252,25 @@ int gunyah_share_range_as_parcels(struct gunyah_vm *ghvm, u64 start_addr,
 				  struct gunyah_vm_parcel **parcels);
 int gunyah_reclaim_parcels(struct gunyah_vm *ghvm,
 				u64 start_gfn, u64 end_gfn);
+/* DiamaneOS: after the last reclaim, parcels not given back stay out of use */
+void gunyah_vm_quarantine_parcels(struct gunyah_vm *ghvm);
 int gunyah_demand_page(struct gunyah_vm *ghvm, u64 gpa, bool write);
 int gunyah_setup_demand_paging(struct gunyah_vm *ghvm, u64 start_gfn,
 				u64 end_gfn);
 int gunyah_vm_set_protected(struct gunyah_vm *ghvm);
-#ifdef CONFIG_DMA_CMA
+
+/*
+ * DiamaneOS: the lend limit.
+ * GUNYAH_LEND_UPFRONT: each physically separate range of a parcel is one
+ * entry, and the limit is per VM: the FP6 resource manager refused VM_START
+ * for VMs of 20186 and 22897 pieces in all their parcels and started one of
+ * 18546, and the lend of a 1536 MiB VM never returned. A parcel that would
+ * take the VM above the limit is refused before it is sent.
+ */
+#define GUNYAH_LEND_MAX_PIECES 20000
+
+/* DiamaneOS: GUNYAH_CMA_MEM, not built with GUNYAH_LEND_UPFRONT */
+#ifdef CONFIG_GUNYAH_CMA_MEM
 int gunyah_cma_mem_init(void);
 void gunyah_cma_mem_exit(void);
 int gunyah_vm_binding_cma_alloc(struct gunyah_vm *ghvm,
@@ -263,7 +285,7 @@ int gunyah_cma_reclaim_parcel(struct gunyah_vm *ghvm,
 #else
 static inline int gunyah_cma_mem_init(void)
 {
-	return -EOPNOTSUPP;
+	return 0;
 }
 static inline void gunyah_cma_mem_exit(void)
 {

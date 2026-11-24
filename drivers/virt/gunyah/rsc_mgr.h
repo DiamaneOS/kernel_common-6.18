@@ -10,6 +10,8 @@
 #include <linux/types.h>
 #include <linux/android_kabi.h>
 
+#include "rsc_mgr_status.h" /* DiamaneOS: raw parcel status */
+
 #define GUNYAH_VMID_INVAL U16_MAX
 #define GUNYAH_MEM_HANDLE_INVAL U32_MAX
 
@@ -62,11 +64,36 @@ struct gunyah_rm_vm_status_payload {
 	__le16 app_status;
 } __packed;
 
+/*
+ * DiamaneOS: who holds a parcel's memory after gunyah_rm_mem_share() or
+ * gunyah_rm_mem_reclaim(), whatever they return.
+ * @GUNYAH_RM_MEM_HOST: the host alone. The resource manager does not hold the
+ *	parcel and the platform gave every run back.
+ * @GUNYAH_RM_MEM_LENT: the resource manager holds the parcel under its
+ *	mem_handle, which a later reclaim may get back.
+ * @GUNYAH_RM_MEM_UNKNOWN: neither is certain, and mem_handle is
+ *	GUNYAH_MEM_HANDLE_INVAL. The host must never touch, zero or hand out
+ *	that memory again.
+ */
+enum gunyah_rm_mem_owner {
+	GUNYAH_RM_MEM_HOST,
+	GUNYAH_RM_MEM_LENT,
+	GUNYAH_RM_MEM_UNKNOWN,
+};
+
+/* DiamaneOS: zero status on a failed, definite call means it was never sent. */
+int gunyah_rm_call_status(struct gunyah_rm *rm, u32 message_id,
+			 const void *req_buf, size_t req_buf_size,
+			 void **resp_buf, size_t *resp_buf_size,
+			 bool *unknown, u32 *status);
+
 /* RPC Calls */
 int gunyah_rm_mem_share(struct gunyah_rm *rm,
-			struct gunyah_rm_mem_parcel *parcel);
+			struct gunyah_rm_mem_parcel *parcel,
+			enum gunyah_rm_mem_owner *owner);
 int gunyah_rm_mem_reclaim(struct gunyah_rm *rm,
-			  struct gunyah_rm_mem_parcel *parcel);
+			  struct gunyah_rm_mem_parcel *parcel,
+			  enum gunyah_rm_mem_owner *owner);
 
 int gunyah_rm_alloc_vmid(struct gunyah_rm *rm, u16 vmid);
 int gunyah_rm_dealloc_vmid(struct gunyah_rm *rm, u16 vmid);
@@ -145,6 +172,11 @@ void gunyah_rm_free_resource(struct gunyah_resource *ghrsc);
 int gunyah_rm_call(struct gunyah_rm *rsc_mgr, u32 message_id,
 		   const void *req_buf, size_t req_buf_size, void **resp_buf,
 		   size_t *resp_buf_size);
+/* DiamaneOS: gunyah_rm_call(), and whether the request may have been lost */
+int gunyah_rm_call_outcome(struct gunyah_rm *rm, u32 message_id,
+			   const void *req_buf, size_t req_buf_size,
+			   void **resp_buf, size_t *resp_buf_size,
+			   bool *unknown);
 
 int gunyah_rm_platform_pre_mem_share(struct gunyah_rm *rm,
 				     struct gunyah_rm_mem_parcel *mem_parcel);

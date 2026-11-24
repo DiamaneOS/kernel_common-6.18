@@ -12,6 +12,9 @@
 
 #include "rsc_mgr.h"
 #include "vm_mgr.h"
+#include "vm_mgr_pool.h" /* DiamaneOS: the VM memory pool */
+
+#include "vm_mgr_ownership.h" /* DiamaneOS: detached quarantine records */
 
 #define WRITE_TAG (1 << 0)
 #define SHARE_TAG (1 << 1)
@@ -512,8 +515,9 @@ int gunyah_demand_page(struct gunyah_vm *ghvm, u64 gpa, bool write)
 		goto unlock;
 	}
 
-	if (b->mem_type == VM_MEM_CMA) {
-		dev_warn(ghvm->parent, "Demand paging of CMA mem not supported\n");
+	/* DiamaneOS: neither CMA nor pool memory is paged on demand */
+	if (b->mem_type != VM_MEM_USER) {
+		dev_warn(ghvm->parent, "Demand paging of CMA or pool mem not supported\n");
 		ret = -EOPNOTSUPP;
 	} else {
 		ret = gunyah_gup_demand_page(ghvm, b, gpa, write);
@@ -525,20 +529,12 @@ unlock:
 }
 EXPORT_SYMBOL_GPL(gunyah_demand_page);
 
-/*
- * Each physically separate range of a parcel is one entry, and the limit is
- * per VM: the FP6 resource manager refused VM_START for VMs of 20186 and
- * 22897 pieces in all their parcels and started one of 18546, and the lend of
- * a 1536 MiB VM never returned. Refuse a parcel that would take the VM above
- * the limit before it is sent.
- */
-#define GUNYAH_LEND_MAX_PIECES 20000
-
 static int gunyah_gup_share_parcel(struct gunyah_vm *ghvm,
 			struct gunyah_vm_parcel *vm_parcel,
 			struct gunyah_vm_binding *b, u64 *gfn, u64 *nr)
 {
 	struct gunyah_rm_mem_parcel *parcel = &vm_parcel->parcel;
+	enum gunyah_rm_mem_owner owner = GUNYAH_RM_MEM_UNKNOWN;
 	struct page **pages;
 	int pinned, ret;
 	struct folio *folio;
@@ -603,24 +599,45 @@ static int gunyah_gup_share_parcel(struct gunyah_vm *ghvm,
 	}
 	parcel->mem_entries[entries].size = entry_size;
 	parcel->n_mem_entries = entries + 1;
-	if (IS_ENABLED(CONFIG_GUNYAH_LEND_UPFRONT) &&
-	    ghvm->lent_pieces + parcel->n_mem_entries > GUNYAH_LEND_MAX_PIECES) {
-		dev_warn(ghvm->parent,
-			 "VM memory at gfn %llx is in %zu pieces, %zu for the whole VM, more than %d: not lent\n",
-			 *gfn, parcel->n_mem_entries,
-			 ghvm->lent_pieces + parcel->n_mem_entries,
-			 GUNYAH_LEND_MAX_PIECES);
-		ret = -E2BIG;
-		goto free_mem_entries;
+	/* DiamaneOS: the piece limits of the VM and of all VMs (vm_mgr_pool_mem.c) */
+	if (IS_ENABLED(CONFIG_GUNYAH_LEND_UPFRONT)) {
+		ret = gunyah_vm_pieces_take(ghvm, *gfn, parcel->n_mem_entries);
+		if (ret)
+			goto free_mem_entries;
 	}
-	ret = gunyah_rm_mem_share(ghvm->rm, parcel);
-	dev_dbg(ghvm->parent, "%s gfn %llx: %llu pages in %zu pieces, ret %d\n",
-		parcel->n_acl_entries == 1 ? "lend" : "share", *gfn, *nr,
-		parcel->n_mem_entries, ret);
-	if (ret)
-		goto free_mem_entries;
+	ret = gunyah_rm_mem_share(ghvm->rm, parcel, &owner);
+	/* DiamaneOS: pieces the hypervisor may hold stay counted (vm_mgr_pool_mem.c) */
+	if (owner == GUNYAH_RM_MEM_HOST)
+		gunyah_vm_pieces_give(ghvm, parcel->n_mem_entries);
+	else if (owner == GUNYAH_RM_MEM_UNKNOWN)
+		gunyah_vm_pieces_uncertain(ghvm, parcel->n_mem_entries);
+	/* DiamaneOS: up-front lends log their piece counts */
 	if (IS_ENABLED(CONFIG_GUNYAH_LEND_UPFRONT))
-		ghvm->lent_pieces += parcel->n_mem_entries;
+		dev_info(ghvm->parent, "%s gfn %llx: %llu pages in %zu pieces, %u for the whole VM, %u for all VMs, ret %d\n",
+			 parcel->n_acl_entries == 1 ? "lend" : "share", *gfn, *nr,
+			 parcel->n_mem_entries, ghvm->lent_pieces,
+			 gunyah_vm_pieces_all(), ret);
+	else
+		dev_dbg(ghvm->parent, "%s gfn %llx: %llu pages in %zu pieces, ret %d\n",
+			parcel->n_acl_entries == 1 ? "lend" : "share", *gfn, *nr,
+			parcel->n_mem_entries, ret);
+	/*
+	 * DiamaneOS: memory the resource manager holds stays a parcel of the
+	 * binding with its pins, also after a failure, for its reclaim. Memory
+	 * whose owner is unknown keeps its pins and their charge for good.
+	 */
+	if (owner == GUNYAH_RM_MEM_UNKNOWN) {
+		dev_err(ghvm->parent, "%llu pages at gfn %llx may be held by the hypervisor: kept pinned\n",
+			*nr, *gfn);
+		b->quarantined = true;
+		gunyah_vm_ordinary_lost(gunyah_gfn_to_gpa(*nr));
+		kvfree(parcel->mem_entries);
+		parcel->mem_entries = NULL;
+		parcel->n_mem_entries = 0;
+		goto free_pages;
+	}
+	if (owner == GUNYAH_RM_MEM_HOST)
+		goto free_mem_entries;
 
 	vm_parcel->start = *gfn;
 	vm_parcel->pages = *nr;
@@ -666,6 +683,11 @@ int gunyah_share_parcel(struct gunyah_vm *ghvm, struct gunyah_vm_parcel *vm_parc
 		goto unlock;
 	}
 
+	/* DiamaneOS: a live or uncertain binding keeps its original descriptor. */
+	if (b->quarantined || b->vm_parcel) {
+		ret = -EBUSY;
+		goto unlock;
+	}
 	parcel->mem_handle = GUNYAH_MEM_HANDLE_INVAL;
 	if (b->share_type == VM_MEM_LEND) {
 		parcel->n_acl_entries = 1;
@@ -711,6 +733,14 @@ int gunyah_share_parcel(struct gunyah_vm *ghvm, struct gunyah_vm_parcel *vm_parc
 			dev_warn(ghvm->parent, "Failed to share CMA memory: %d\n", ret);
 			goto free_acl;
 		}
+	} else if (b->mem_type == VM_MEM_POOL) {
+		/* DiamaneOS: the VM memory pool (vm_mgr_pool_mem.c) */
+		ret = gunyah_vm_pool_share_parcel(ghvm, vm_parcel, b, gfn, nr);
+		if (ret) {
+			dev_warn(ghvm->parent, "Failed to %s pool memory: %d\n",
+				 lend ? "lend" : "share", ret);
+			goto free_acl;
+		}
 	} else {
 		ret = gunyah_gup_share_parcel(ghvm, vm_parcel, b, gfn, nr);
 		if (ret) {
@@ -721,6 +751,9 @@ int gunyah_share_parcel(struct gunyah_vm *ghvm, struct gunyah_vm_parcel *vm_parc
 	goto unlock;
 
 free_acl:
+	/* DiamaneOS: a parcel the resource manager still holds keeps its ACL for its reclaim */
+	if (b->vm_parcel == vm_parcel)
+		goto unlock;
 	kfree(parcel->acl_entries);
 	parcel->acl_entries = NULL;
 unlock:
@@ -772,6 +805,7 @@ static int gunyah_gup_reclaim_parcel(struct gunyah_vm *ghvm,
 		struct gunyah_vm_parcel *vm_parcel, struct gunyah_vm_binding *b)
 {
 	struct gunyah_rm_mem_parcel *parcel = &vm_parcel->parcel;
+	enum gunyah_rm_mem_owner owner = GUNYAH_RM_MEM_UNKNOWN;
 	struct gunyah_rm_mem_entry *entry;
 	struct folio *folio;
 	pgoff_t i;
@@ -782,7 +816,7 @@ static int gunyah_gup_reclaim_parcel(struct gunyah_vm *ghvm,
 	if (parcel->mem_handle == GUNYAH_MEM_HANDLE_INVAL)
 		return 0;
 
-	ret = gunyah_rm_mem_reclaim(ghvm->rm, parcel);
+	ret = gunyah_rm_mem_reclaim(ghvm->rm, parcel, &owner);
 	if (ret) {
 		dev_err(ghvm->parent, "Failed to reclaim parcel: %d\n",
 			ret);
@@ -821,8 +855,7 @@ static int gunyah_gup_reclaim_parcel(struct gunyah_vm *ghvm,
 	}
 
 	if (IS_ENABLED(CONFIG_GUNYAH_LEND_UPFRONT))
-		ghvm->lent_pieces -= min_t(u32, ghvm->lent_pieces,
-					   parcel->n_mem_entries);
+		gunyah_vm_pieces_give(ghvm, parcel->n_mem_entries);
 	parcel->mem_handle = GUNYAH_MEM_HANDLE_INVAL;
 	kvfree(parcel->mem_entries);
 	kfree(parcel->acl_entries);
@@ -847,12 +880,33 @@ static int gunyah_reclaim_parcel(struct gunyah_vm *ghvm,
 
 	if (b->mem_type == VM_MEM_CMA)
 		ret = gunyah_cma_reclaim_parcel(ghvm, vm_parcel, b);
+	else if (b->mem_type == VM_MEM_POOL) /* DiamaneOS: the VM memory pool */
+		ret = gunyah_vm_pool_reclaim_parcel(ghvm, vm_parcel, b);
 	else
 		ret = gunyah_gup_reclaim_parcel(ghvm, vm_parcel, b);
 
 unlock:
 	up_write(&ghvm->bindings_lock);
 	return ret;
+}
+
+/*
+ * DiamaneOS: called after the last reclaim of a VM going away. A parcel still
+ * bound was not given back: the hypervisor may hold it. Its pages stay pinned
+ * (ordinary memory) or out of the pool (its file still counts it lent), and
+ * its pieces stay counted after the VM is gone.
+ */
+void gunyah_vm_quarantine_parcels(struct gunyah_vm *ghvm)
+{
+	struct gunyah_vm_binding *b;
+	unsigned long gfn = 0;
+
+	down_read(&ghvm->bindings_lock);
+	mt_for_each(&ghvm->bindings, b, gfn, ULONG_MAX)
+		if (b->vm_parcel && b->mem_type == VM_MEM_USER)
+			gunyah_vm_ordinary_lost(gunyah_gfn_to_gpa(b->vm_parcel->pages));
+	up_read(&ghvm->bindings_lock);
+	gunyah_vm_pieces_uncertain(ghvm, ghvm->lent_pieces);
 }
 
 int gunyah_reclaim_parcels(struct gunyah_vm *ghvm, u64 start_gfn,
@@ -1017,9 +1071,12 @@ rollback:
 		if ((*parcels)[count].parcel.mem_handle !=
 			GUNYAH_MEM_HANDLE_INVAL) {
 			ret_err = gunyah_reclaim_parcel(ghvm, &(*parcels)[count]);
-			if (ret_err)
+			if (ret_err) {
 				dev_err(ghvm->parent, "Failed to reclaim parcel: %d, memory will leak\n",
 										ret_err);
+				/* DiamaneOS: detach before the parent array goes away. */
+				gunyah_vm_detach_quarantined(ghvm, &(*parcels)[count]);
+			}
 		}
 	}
 	kfree(*parcels);

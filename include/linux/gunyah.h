@@ -292,6 +292,12 @@ enum gunyah_pagetable_access {
 	/* clang-format on */
 };
 
+/*
+ * DiamaneOS: pre_mem_share returns -ENOTRECOVERABLE when it failed and could
+ * not give every run it had moved back to the host. post_mem_reclaim tries
+ * every run and returns the first failure. After either, the host must never
+ * use the parcel's memory again.
+ */
 struct gunyah_rm_platform_ops {
 	int (*pre_mem_share)(struct gunyah_rm *rm,
 			     struct gunyah_rm_mem_parcel *mem_parcel);
