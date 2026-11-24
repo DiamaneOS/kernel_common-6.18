@@ -17,6 +17,8 @@
 
 #include "rsc_mgr.h"
 #include "vm_mgr.h"
+#include "vm_mgr_start_state.h" /* DiamaneOS: terminal startup state */
+#include "vm_mgr_pool.h" /* DiamaneOS: the VM memory pool */
 
 #define GUNYAH_VM_ADDRSPACE_LABEL 0
 // "To" extent for main memory of the guest
@@ -769,10 +771,18 @@ static inline void setup_extent_ticket(struct gunyah_vm *ghvm,
 static __must_check struct gunyah_vm *gunyah_vm_alloc(struct gunyah_rm *rm)
 {
 	struct gunyah_vm *ghvm;
+	int ret;
 
 	ghvm = kzalloc(sizeof(*ghvm), GFP_KERNEL);
 	if (!ghvm)
 		return ERR_PTR(-ENOMEM);
+
+	/* DiamaneOS: no startup operation precedes its error-state allocation. */
+	ret = gunyah_vm_start_state_init(ghvm);
+	if (ret) {
+		kfree(ghvm);
+		return ERR_PTR(ret);
+	}
 
 	ghvm->parent = gunyah_rm_get(rm);
 	ghvm->vmid = GUNYAH_VMID_INVAL;
@@ -903,10 +913,16 @@ static int gunyah_vm_start(struct gunyah_vm *ghvm)
 	struct gunyah_rm_hyp_resources *resources = NULL;
 	struct gunyah_resource *ghrsc;
 	bool configured = false;
-	int ret, i, n;
+	int ret, cleanup_ret, i, n;
 	u16 vmid = 0;
 
 	down_write(&ghvm->status_lock);
+	/* DiamaneOS: a failed start cannot revisit unresolved backing. */
+	ret = gunyah_vm_start_error(ghvm);
+	if (ret) {
+		up_write(&ghvm->status_lock);
+		return ret;
+	}
 	if (ghvm->vm_status != GUNYAH_RM_VM_STATUS_NO_STATE) {
 		up_write(&ghvm->status_lock);
 		return 0;
@@ -1048,13 +1064,16 @@ static int gunyah_vm_start(struct gunyah_vm *ghvm)
 	kfree(resources);
 	return ret;
 err_dealloc_vmid:
-	ret = gunyah_rm_dealloc_vmid(ghvm->rm, ghvm->vmid);
-	if (ret)
+	/* DiamaneOS: cleanup must not replace the startup failure. */
+	cleanup_ret = gunyah_rm_dealloc_vmid(ghvm->rm, ghvm->vmid);
+	if (cleanup_ret)
 		dev_warn(ghvm->parent,
-			 "Failed to deallocate vmid: %d\n", ret);
+			 "Failed to deallocate vmid: %d\n", cleanup_ret);
 err_rm_notifier_unregister:
 	gunyah_rm_notifier_unregister(ghvm->rm, &ghvm->nb);
 err:
+	/* DiamaneOS: preserve the first error on every subsequent start. */
+	gunyah_vm_start_state_fail(ghvm, ret);
 	if (configured && ghvm->vm_status == GUNYAH_RM_VM_STATUS_LOAD)
 		gunyah_vm_init_for_teardown(ghvm);
 	/* gunyah_vm_free will handle releasing resources and reclaiming memory */
@@ -1072,6 +1091,12 @@ static int gunyah_vm_ensure_started(struct gunyah_vm *ghvm)
 	if (ret)
 		return ret;
 
+	/* DiamaneOS: a terminal start failure also applies after LOAD. */
+	ret = gunyah_vm_start_error(ghvm);
+	if (ret) {
+		up_read(&ghvm->status_lock);
+		return ret;
+	}
 	/* Unlikely because VM is typically started */
 	if (unlikely(ghvm->vm_status == GUNYAH_RM_VM_STATUS_NO_STATE)) {
 		up_read(&ghvm->status_lock);
@@ -1193,6 +1218,7 @@ static long gunyah_vm_ioctl(struct file *filp, unsigned int cmd,
 	}
 	case GH_VM_ANDROID_MAP_CMA_MEM: {
 		struct gunyah_map_cma_mem_args cma_mem;
+		struct file *file; /* DiamaneOS: a pool or CMA file */
 
 		/* only allow owner task to add memory */
 		if (ghvm->mm_s != current->mm)
@@ -1201,7 +1227,16 @@ static long gunyah_vm_ioctl(struct file *filp, unsigned int cmd,
 		if (copy_from_user(&cma_mem, argp, sizeof(cma_mem)))
 			return -EFAULT;
 
-		r = gunyah_vm_binding_cma_alloc(ghvm, &cma_mem);
+		/* DiamaneOS: a file of the VM memory pool, else a CMA file. */
+		file = fget(cma_mem.guest_mem_fd);
+		if (!file)
+			return -EBADF;
+		if (gunyah_vm_pool_mem_file(file)) {
+			r = gunyah_vm_binding_pool_alloc(ghvm, &cma_mem, file);
+		} else {
+			fput(file);
+			r = gunyah_vm_binding_cma_alloc(ghvm, &cma_mem);
+		}
 		break;
 	}
 	case GUNYAH_VM_SET_BOOT_CONTEXT: {
@@ -1304,13 +1339,15 @@ static void _gunyah_vm_put(struct kref *kref)
 	}
 
 	WARN_ON(gunyah_reclaim_parcels(ghvm, 0, ULONG_MAX));
+	gunyah_vm_quarantine_parcels(ghvm); /* DiamaneOS */
 	kfree(ghvm->upfront_parcels);
 	ghvm->upfront_parcels = NULL;
 	ghvm->n_upfront_parcels = 0;
 	down_write(&ghvm->bindings_lock);
 	mt_for_each(&ghvm->bindings, b, index, ULONG_MAX) {
 		mtree_erase(&ghvm->bindings, gunyah_gpa_to_gfn(b->guest_phys_addr));
-		if (b->mem_type == VM_MEM_CMA && b->cma.file)
+		/* DiamaneOS: a pool binding holds its file as a CMA one does */
+		if ((b->mem_type == VM_MEM_CMA || b->mem_type == VM_MEM_POOL) && b->cma.file)
 			fput(b->cma.file);
 		kfree(b);
 	}
@@ -1334,6 +1371,7 @@ static void _gunyah_vm_put(struct kref *kref)
 	gunyah_put_auth_vm_mgr(ghvm);
 	xa_destroy(&ghvm->boot_context);
 	gunyah_rm_put(ghvm->rm);
+	gunyah_vm_start_state_release(ghvm); /* DiamaneOS */
 	mmdrop(ghvm->mm_s);
 	kfree(ghvm);
 }
@@ -1395,6 +1433,9 @@ err_put_fd:
 	put_unused_fd(fd);
 err_destroy_vm:
 	gunyah_rm_put(ghvm->rm);
+	/* DiamaneOS: the VM was never published, drop its startup state and mm reference. */
+	gunyah_vm_start_state_release(ghvm);
+	mmdrop(ghvm->mm_s);
 	kfree(ghvm);
 	return err;
 }

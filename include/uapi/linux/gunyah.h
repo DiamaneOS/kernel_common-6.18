@@ -421,6 +421,25 @@ struct gunyah_map_cma_mem_args {
 
 #define GH_VM_ANDROID_MAP_CMA_MEM _IOW(GH_ANDROID_IOCTL_TYPE, 0x15, struct gunyah_map_cma_mem_args)
 
+/* DiamaneOS: the VM memory pool set aside at boot (drivers/virt/gunyah) */
+/**
+ * struct gunyah_vm_pool_mem_args - Memory for one protected VM from the pool set aside at boot
+ * @size: Size in bytes, a multiple of the page size. The pool hands out 2 MiB blocks.
+ * @flags: Must be 0.
+ *
+ * Issued on /dev/gunyah_vm_pool, once per open. Returns a file that holds the
+ * memory, to be bound to one VM with GH_VM_ANDROID_MAP_CMA_MEM. Fails with
+ * ENOMEM when the pool cannot hold @size now, EFBIG when @size is larger than
+ * one pool VM may be, and EBUSY on a second call on the same open.
+ */
+struct gunyah_vm_pool_mem_args {
+	__u64 size;
+	__u64 flags;
+};
+
+#define GH_ANDROID_CREATE_POOL_MEM_FD	_IOW(GH_ANDROID_IOCTL_TYPE, 0x30, \
+					     struct gunyah_vm_pool_mem_args)
+
 /**
  * enum gunyah_auth_type - Valid types of authentication supported by Gunyah
  */

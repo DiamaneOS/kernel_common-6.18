@@ -159,6 +159,7 @@ int gunyah_cma_reclaim_parcel(struct gunyah_vm *ghvm, struct gunyah_vm_parcel *v
 				struct gunyah_vm_binding *b)
 {
 	struct gunyah_rm_mem_parcel *parcel = &vm_parcel->parcel;
+	enum gunyah_rm_mem_owner owner;
 	struct gunyah_cma *cma;
 	int ret;
 
@@ -167,7 +168,7 @@ int gunyah_cma_reclaim_parcel(struct gunyah_vm *ghvm, struct gunyah_vm_parcel *v
 
 	cma = b->cma.file->private_data;
 	down_write(&cma->parcel_lock);
-	ret = gunyah_rm_mem_reclaim(ghvm->rm, parcel);
+	ret = gunyah_rm_mem_reclaim(ghvm->rm, parcel, &owner);
 	if (ret) {
 		dev_err(ghvm->parent, "Failed to reclaim parcel: %d\n",
 			ret);
@@ -194,6 +195,7 @@ int gunyah_cma_share_parcel(struct gunyah_vm *ghvm, struct gunyah_vm_parcel *vm_
 				struct gunyah_vm_binding *b, u64 *gfn, u64 *nr)
 {
 	struct gunyah_rm_mem_parcel *parcel = &vm_parcel->parcel;
+	enum gunyah_rm_mem_owner owner;
 	u64 offset, page_offset;
 	struct gunyah_cma *cma;
 	int ret;
@@ -221,7 +223,7 @@ int gunyah_cma_share_parcel(struct gunyah_vm *ghvm, struct gunyah_vm_parcel *vm_
 		cpu_to_le64(page_to_phys(cma->page + page_offset));
 
 	down_write(&cma->parcel_lock);
-	ret = gunyah_rm_mem_share(ghvm->rm, parcel);
+	ret = gunyah_rm_mem_share(ghvm->rm, parcel, &owner);
 	if (ret) {
 		up_write(&cma->parcel_lock);
 		goto free_mem_entries;

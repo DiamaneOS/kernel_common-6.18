@@ -23,6 +23,7 @@
 
 #include "rsc_mgr.h"
 #include "vm_mgr.h"
+#include "vm_mgr_pool.h" /* DiamaneOS: the VM memory pool */
 
 /* clang-format off */
 #define RM_RPC_API_VERSION_MASK		GENMASK(3, 0)
@@ -65,30 +66,8 @@ struct gunyah_rm_rpc_reply_hdr {
 #define GUNYAH_RM_PAYLOAD_SIZE \
 	(GUNYAH_RM_MSGQ_MSG_SIZE - sizeof(struct gunyah_rm_rpc_hdr))
 
-/* RM Error codes */
-enum gunyah_rm_error {
-	/* clang-format off */
-	GUNYAH_RM_ERROR_OK			= 0x0,
-	GUNYAH_RM_ERROR_UNIMPLEMENTED		= 0xFFFFFFFF,
-	GUNYAH_RM_ERROR_NOMEM			= 0x1,
-	GUNYAH_RM_ERROR_NORESOURCE		= 0x2,
-	GUNYAH_RM_ERROR_DENIED			= 0x3,
-	GUNYAH_RM_ERROR_INVALID			= 0x4,
-	GUNYAH_RM_ERROR_BUSY			= 0x5,
-	GUNYAH_RM_ERROR_ARGUMENT_INVALID	= 0x6,
-	GUNYAH_RM_ERROR_HANDLE_INVALID		= 0x7,
-	GUNYAH_RM_ERROR_VALIDATE_FAILED		= 0x8,
-	GUNYAH_RM_ERROR_MAP_FAILED		= 0x9,
-	GUNYAH_RM_ERROR_MEM_INVALID		= 0xA,
-	GUNYAH_RM_ERROR_MEM_INUSE		= 0xB,
-	GUNYAH_RM_ERROR_MEM_RELEASED		= 0xC,
-	GUNYAH_RM_ERROR_VMID_INVALID		= 0xD,
-	GUNYAH_RM_ERROR_LOOKUP_FAILED		= 0xE,
-	GUNYAH_RM_ERROR_IRQ_INVALID		= 0xF,
-	GUNYAH_RM_ERROR_IRQ_INUSE		= 0x10,
-	GUNYAH_RM_ERROR_IRQ_RELEASED		= 0x11,
-	/* clang-format on */
-};
+/* DiamaneOS: wire statuses are shared with the parcel RPC layer. */
+#include "rsc_mgr_status.h"
 
 struct gunyah_rm_info {
 	__le64 tx_msgq_cap;
@@ -631,10 +610,42 @@ static int gunyah_rm_send_request(struct gunyah_rm *rm, u32 message_id,
 int gunyah_rm_call(struct gunyah_rm *rm, u32 message_id, const void *req_buf,
 		   size_t req_buf_size, void **resp_buf, size_t *resp_buf_size)
 {
+	bool unknown;
+
+	return gunyah_rm_call_outcome(rm, message_id, req_buf, req_buf_size,
+				      resp_buf, resp_buf_size, &unknown);
+}
+EXPORT_SYMBOL_GPL(gunyah_rm_call);
+
+/*
+ * DiamaneOS: gunyah_rm_call(). On failure, *unknown says whether the request
+ * may have reached the resource manager without its reply coming back (the
+ * send failed part way, or the reply could not be received): what the
+ * resource manager did is then unknown. It is false for a refusal by the
+ * resource manager and for a request that was never sent.
+ */
+int gunyah_rm_call_outcome(struct gunyah_rm *rm, u32 message_id,
+			   const void *req_buf, size_t req_buf_size,
+			   void **resp_buf, size_t *resp_buf_size,
+			   bool *unknown)
+{
+	return gunyah_rm_call_status(rm, message_id, req_buf, req_buf_size,
+				     resp_buf, resp_buf_size, unknown, NULL);
+}
+
+/* DiamaneOS: raw status distinguishes a live parcel refusal from lost identity. */
+int gunyah_rm_call_status(struct gunyah_rm *rm, u32 message_id,
+			 const void *req_buf, size_t req_buf_size,
+			 void **resp_buf, size_t *resp_buf_size,
+			 bool *unknown, u32 *status)
+{
 	struct gunyah_rm_message message = { 0 };
 	u32 seq_id;
 	int ret;
 
+	*unknown = false;
+	if (status)
+		*status = 0;
 	/* message_id 0 is reserved. req_buf_size implies req_buf is not NULL */
 	if (!rm || !message_id || (!req_buf && req_buf_size))
 		return -EINVAL;
@@ -665,6 +676,8 @@ int gunyah_rm_call(struct gunyah_rm *rm, u32 message_id, const void *req_buf,
 		 * erased it before completing us.
 		 */
 		xa_erase(&rm->call_xarray, message.reply.seq);
+		/* DiamaneOS: part of the request may have gone out */
+		*unknown = true;
 		goto out;
 	}
 
@@ -677,9 +690,14 @@ int gunyah_rm_call(struct gunyah_rm *rm, u32 message_id, const void *req_buf,
 	/* Check for internal (kernel) error waiting for the response */
 	if (message.reply.ret) {
 		ret = message.reply.ret;
+		/* DiamaneOS: the resource manager acted, its reply was lost */
+		*unknown = true;
 		goto out;
 	}
 
+	/* DiamaneOS: return the wire status before mapping it to errno. */
+	if (status)
+		*status = message.reply.rm_error;
 	/* Got a response, did resource manager give us an error? */
 	if (message.reply.rm_error != GUNYAH_RM_ERROR_OK) {
 		pr_warn("RM rejected message %08x. Error: %d\n",
@@ -706,7 +724,6 @@ out:
 	mutex_unlock(&rm->send_lock);
 	return ret;
 }
-EXPORT_SYMBOL_GPL(gunyah_rm_call);
 
 int gunyah_rm_notifier_register(struct gunyah_rm *rm, struct notifier_block *nb)
 {
@@ -1068,6 +1085,11 @@ static int __init gunyah_rm_init(void)
 	if (ret)
 		pr_err("Failed to register gunyah CMA device\n");
 
+	/* DiamaneOS: the VM memory pool set aside at boot */
+	ret = gunyah_vm_pool_init();
+	if (ret)
+		pr_err("Failed to set up the VM memory pool: %d\n", ret);
+
 	ret = gunyah_rm_sysfs_register(rm);
 	if (ret)
 		pr_err("Failed to setup RM log\n");
@@ -1094,6 +1116,7 @@ static void __exit gunyah_rm_exit(void)
 		return;
 
 	gunyah_rm_sysfs_unregister();
+	gunyah_vm_pool_exit(); /* DiamaneOS: the VM memory pool */
 	gunyah_cma_mem_exit();
 	auxiliary_device_delete(&rm->adev);
 	misc_deregister(&rm->miscdev);

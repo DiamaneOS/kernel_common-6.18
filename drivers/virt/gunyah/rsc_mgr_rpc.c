@@ -223,10 +223,12 @@ static int gunyah_rm_mem_append(struct gunyah_rm *rm, u32 mem_handle,
  * gunyah_rm_mem_share() - Share memory with other virtual machines.
  * @rm: Handle to a Gunyah resource manager
  * @p: Information about the memory to be shared.
+ * @owner: DiamaneOS: who holds the memory afterwards, also on failure
  *
  * Sharing keeps Linux's access to the memory while the memory parcel is shared.
  */
-int gunyah_rm_mem_share(struct gunyah_rm *rm, struct gunyah_rm_mem_parcel *p)
+int gunyah_rm_mem_share(struct gunyah_rm *rm, struct gunyah_rm_mem_parcel *p,
+			enum gunyah_rm_mem_owner *owner)
 {
 	u32 message_id = p->n_acl_entries == 1 ? GUNYAH_RM_RPC_MEM_LEND :
 						 GUNYAH_RM_RPC_MEM_SHARE;
@@ -236,11 +238,12 @@ int gunyah_rm_mem_share(struct gunyah_rm *rm, struct gunyah_rm_mem_parcel *p)
 	struct gunyah_rm_mem_share_req_header *req_header;
 	size_t acl_size, mem_size;
 	u32 *attr_section;
-	bool need_append = false;
-	__le32 *resp;
+	bool need_append = false, unknown;
+	__le32 *resp = NULL;
 	void *msg;
 	int ret;
 
+	*owner = GUNYAH_RM_MEM_HOST;
 	if (!p->acl_entries || !p->n_acl_entries || !p->mem_entries ||
 	    !p->n_mem_entries || p->n_acl_entries > U8_MAX ||
 	    p->mem_handle != GUNYAH_MEM_HANDLE_INVAL)
@@ -271,6 +274,9 @@ int gunyah_rm_mem_share(struct gunyah_rm *rm, struct gunyah_rm_mem_parcel *p)
 	ret = gunyah_rm_platform_pre_mem_share(rm, p);
 	if (ret) {
 		kfree(msg);
+		/* DiamaneOS: the platform could not give every run back */
+		if (ret == -ENOTRECOVERABLE)
+			*owner = GUNYAH_RM_MEM_UNKNOWN;
 		return ret;
 	}
 
@@ -295,26 +301,43 @@ int gunyah_rm_mem_share(struct gunyah_rm *rm, struct gunyah_rm_mem_parcel *p)
 	/* Set n_entries for memory attribute section to 0 */
 	*attr_section = 0;
 
-	ret = gunyah_rm_call(rm, message_id, msg, msg_size, (void **)&resp,
-			     &resp_size);
+	ret = gunyah_rm_call_outcome(rm, message_id, msg, msg_size,
+				     (void **)&resp, &resp_size, &unknown);
 	kfree(msg);
 
+	/*
+	 * DiamaneOS: a lend the resource manager refused is the host's again
+	 * once the platform gave every run back. Without its reply the
+	 * resource manager may hold the parcel: the platform's assignment
+	 * stays, and so does the memory's quarantine.
+	 */
 	if (ret) {
-		gunyah_rm_platform_post_mem_reclaim(rm, p);
+		if (unknown || gunyah_rm_platform_post_mem_reclaim(rm, p))
+			*owner = GUNYAH_RM_MEM_UNKNOWN;
 		return ret;
+	}
+	if (resp_size < sizeof(*resp)) {
+		kfree(resp);
+		*owner = GUNYAH_RM_MEM_UNKNOWN;
+		return -EBADMSG;
 	}
 
 	p->mem_handle = le32_to_cpu(*resp);
 	kfree(resp);
+	/* DiamaneOS: success without a parcel identity cannot be reclaimed. */
+	if (p->mem_handle == GUNYAH_MEM_HANDLE_INVAL) {
+		*owner = GUNYAH_RM_MEM_UNKNOWN;
+		return -EBADMSG;
+	}
+	*owner = GUNYAH_RM_MEM_LENT;
 
 	if (need_append) {
 		ret = gunyah_rm_mem_append(
 			rm, p->mem_handle, &p->mem_entries[initial_mem_entries],
 			p->n_mem_entries - initial_mem_entries);
-		if (ret) {
-			gunyah_rm_mem_reclaim(rm, p);
-			p->mem_handle = GUNYAH_MEM_HANDLE_INVAL;
-		}
+		/* DiamaneOS: the reclaim's owner and handle are the parcel's */
+		if (ret)
+			gunyah_rm_mem_reclaim(rm, p, owner);
 	}
 
 	return ret;
@@ -325,15 +348,19 @@ ALLOW_ERROR_INJECTION(gunyah_rm_mem_share, ERRNO);
  * gunyah_rm_mem_reclaim() - Reclaim a memory parcel
  * @rm: Handle to a Gunyah resource manager
  * @parcel: Information about the memory to be reclaimed.
+ * @owner: DiamaneOS: who holds the memory afterwards, also on failure
  *
  * RM maps the associated memory back into the stage-2 page tables of the owner VM.
  */
 int gunyah_rm_mem_reclaim(struct gunyah_rm *rm,
-			  struct gunyah_rm_mem_parcel *parcel)
+			  struct gunyah_rm_mem_parcel *parcel,
+			  enum gunyah_rm_mem_owner *owner)
 {
 	struct gunyah_rm_mem_release_req req = {
 		.mem_handle = cpu_to_le32(parcel->mem_handle),
 	};
+	bool unknown;
+	u32 status;
 	int ret;
 
 	/*
@@ -344,13 +371,29 @@ int gunyah_rm_mem_reclaim(struct gunyah_rm *rm,
 	if (IS_ENABLED(CONFIG_GUNYAH_LEND_UPFRONT) && parcel->n_acl_entries == 1)
 		req.flags = GUNYAH_RM_MEM_RECLAIM_FLAG_SANITIZE;
 
-	ret = gunyah_rm_call(rm, GUNYAH_RM_RPC_MEM_RECLAIM, &req, sizeof(req),
-			     NULL, NULL);
+	ret = gunyah_rm_call_status(rm, GUNYAH_RM_RPC_MEM_RECLAIM, &req,
+				    sizeof(req), NULL, NULL, &unknown, &status);
+	/*
+	 * DiamaneOS: a refused reclaim leaves the parcel with the resource
+	 * manager under its handle, for a later reclaim. Once the resource
+	 * manager may have let it go, the handle is never sent again, and the
+	 * memory is the host's only when the platform gave every run back.
+	 */
+	/* DiamaneOS: only a never-sent call or BUSY confirms a live handle. */
+	if (ret && !unknown && (!status || status == GUNYAH_RM_ERROR_BUSY)) {
+		*owner = GUNYAH_RM_MEM_LENT;
+		return ret;
+	}
+	parcel->mem_handle = GUNYAH_MEM_HANDLE_INVAL;
+	*owner = GUNYAH_RM_MEM_UNKNOWN;
 	/* Only call platform mem reclaim hooks if we reclaimed the memory */
 	if (ret)
 		return ret;
 
-	return gunyah_rm_platform_post_mem_reclaim(rm, parcel);
+	ret = gunyah_rm_platform_post_mem_reclaim(rm, parcel);
+	if (!ret)
+		*owner = GUNYAH_RM_MEM_HOST;
+	return ret;
 }
 ALLOW_ERROR_INJECTION(gunyah_rm_mem_reclaim, ERRNO);
 
