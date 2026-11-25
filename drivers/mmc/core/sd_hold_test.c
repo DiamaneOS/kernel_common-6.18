@@ -3,8 +3,10 @@
  * DiamaneOS: KUnit test of the hold of new cards, built into sd_hold.c.
  *
  * Each test registers a host whose controller fails every command and counts
- * them. A held removable host must get no command, a non-removable one is
- * never held, and clearing the hold starts a card that waits.
+ * them. A held removable host must get no command and no prescan power-up, a
+ * non-removable one is never held, and clearing the hold starts a card that
+ * waits. A card powered off while held is not resumed after a card detect
+ * event.
  */
 
 #include <kunit/device.h>
@@ -14,6 +16,7 @@
 
 struct hold_test_slot {
 	atomic_t commands;
+	atomic_t power_ups;
 	int card_present;
 };
 
@@ -28,6 +31,10 @@ static void hold_test_request(struct mmc_host *host, struct mmc_request *mrq)
 
 static void hold_test_set_ios(struct mmc_host *host, struct mmc_ios *ios)
 {
+	struct hold_test_slot *slot = mmc_priv(host);
+
+	if (ios->power_mode == MMC_POWER_UP)
+		atomic_inc(&slot->power_ups);
 }
 
 static int hold_test_get_cd(struct mmc_host *host)
@@ -79,6 +86,7 @@ static struct mmc_host *hold_test_host(struct kunit *test, bool removable)
 			hold_test_free_host, host));
 	slot = mmc_priv(host);
 	atomic_set(&slot->commands, 0);
+	atomic_set(&slot->power_ups, 0);
 	slot->card_present = 1;
 	host->ops = &hold_test_ops;
 	host->f_min = 400000;
@@ -118,6 +126,8 @@ static void hold_test_non_removable_never_held(struct kunit *test)
 	hold_set(1);
 	host = hold_test_host(test, false);
 	KUNIT_EXPECT_GT(test, hold_test_commands(host), 0);
+	/* Its prescan power-up as on stock. */
+	KUNIT_EXPECT_GT(test, atomic_read(&((struct hold_test_slot *)mmc_priv(host))->power_ups), 0);
 }
 
 static void hold_test_card_taken_out_while_held(struct kunit *test)
@@ -149,6 +159,43 @@ static void hold_test_set_again_holds_next_card(struct kunit *test)
 	hold_set(1);
 	mmc_detect_change(host, 0);
 	KUNIT_EXPECT_EQ(test, seen, hold_test_commands(host));
+}
+
+static void hold_test_held_host_not_powered_at_start(struct kunit *test)
+{
+	struct hold_test_slot *slot;
+	struct mmc_host *host;
+
+	hold_set(1);
+	host = hold_test_host(test, true);
+	slot = mmc_priv(host);
+	KUNIT_EXPECT_EQ(test, 0, atomic_read(&slot->power_ups));
+}
+
+static void hold_test_card_event_while_off(struct kunit *test)
+{
+	struct mmc_host *host;
+
+	hold_set(1);
+	host = hold_test_host(test, true);
+
+	/* A card that stayed: no card detect event while it was off. */
+	mmc_sd_hold_card_off(host);
+	KUNIT_EXPECT_FALSE(test, mmc_sd_hold_card_moved(host));
+
+	/* A card detect event while it was off: it may have been swapped. */
+	mmc_detect_change(host, 0);
+	KUNIT_EXPECT_TRUE(test, mmc_sd_hold_card_moved(host));
+	/* Rescans of the host itself are no card detect event. */
+	mmc_sd_hold_card_off(host);
+	_mmc_detect_change(host, 0, false);
+	KUNIT_EXPECT_FALSE(test, mmc_sd_hold_card_moved(host));
+
+	/* Unlocked, a card resumes as on stock (its CID is compared). */
+	mmc_detect_change(host, 0);
+	hold_set(0);
+	KUNIT_EXPECT_FALSE(test, mmc_sd_hold_card_moved(host));
+	hold_test_commands(host);
 }
 
 static int hold_test_write(const char *text)
@@ -184,6 +231,8 @@ static struct kunit_case hold_test_cases[] = {
 	KUNIT_CASE(hold_test_card_taken_out_while_held),
 	KUNIT_CASE(hold_test_set_again_holds_next_card),
 	KUNIT_CASE(hold_test_sysctl),
+	KUNIT_CASE(hold_test_held_host_not_powered_at_start),
+	KUNIT_CASE(hold_test_card_event_while_off),
 	{}
 };
 

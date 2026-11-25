@@ -10,6 +10,13 @@
  * card, so a held card starts as if just inserted. Hosts with
  * MMC_CAP_NONREMOVABLE (eMMC, soldered SDIO chips) are never held.
  *
+ * A card that was already working when the hold was set keeps working, also
+ * across sleep: its power-off and resume keep it. But a card detect event while
+ * it was powered off means it may have been swapped: while held, it is not
+ * powered again and gets no command, it is dropped as removed, and whatever card
+ * is in the slot now waits like any new card. The prescan power-up of a
+ * removable host at its start is skipped while held.
+ *
  * The hold is set at boot and stays set until userspace clears it. On Android,
  * the system server sets security.hold_new_sd from the lock screen state and
  * init writes it here.
@@ -17,8 +24,10 @@
 
 #define pr_fmt(fmt) "mmc: " fmt
 
+#include <linux/atomic.h>
 #include <linux/capability.h>
 #include <linux/init.h>
+#include <linux/interrupt.h>
 #include <linux/mmc/host.h>
 #include <linux/mutex.h>
 #include <linux/ratelimit.h>
@@ -38,6 +47,62 @@ static struct ratelimit_state hold_log =
 
 /* Serialises changes of the hold with __mmc_stop_host() (mmc_sd_hold_sync). */
 static DEFINE_MUTEX(hold_lock);
+
+/*
+ * Per host (by its index): the card detect events seen, and their count when
+ * the host's card was powered off. Hosts above the table are never held across
+ * a power-off: their card is treated as moved.
+ */
+#define HOLD_HOSTS 16
+static atomic_t cd_events[HOLD_HOSTS];
+static int cd_events_at_off[HOLD_HOSTS];
+
+static bool held_removable(struct mmc_host *host)
+{
+	return mmc_card_is_removable(host) && READ_ONCE(hold_new_sd);
+}
+
+/* _mmc_detect_change() for a card detect event (cd_irq). */
+void mmc_sd_hold_cd_event(struct mmc_host *host)
+{
+	if (host->index >= 0 && host->index < HOLD_HOSTS)
+		atomic_inc(&cd_events[host->index]);
+}
+
+/* _mmc_sd_suspend() after it powered the card off. Under the host's claim. */
+void mmc_sd_hold_card_off(struct mmc_host *host)
+{
+	if (host->index >= 0 && host->index < HOLD_HOSTS)
+		cd_events_at_off[host->index] = atomic_read(&cd_events[host->index]);
+}
+
+/*
+ * _mmc_sd_resume() before it powers the card on, under the host's claim: true
+ * when the card must not be resumed, because the hold is set and a card detect
+ * event came while it was off. A card detect interrupt that came in sleep runs
+ * first, so its event is counted.
+ */
+bool mmc_sd_hold_card_moved(struct mmc_host *host)
+{
+	if (!held_removable(host))
+		return false;
+	if (host->slot.cd_irq >= 0)
+		synchronize_irq(host->slot.cd_irq);
+	if (host->index < 0 || host->index >= HOLD_HOSTS)
+		return true;
+	if (atomic_read(&cd_events[host->index]) == cd_events_at_off[host->index])
+		return false;
+	if (__ratelimit(&hold_log))
+		pr_info("%s: card may have been swapped while off, dropped (kernel.hold_new_sd)\n",
+			mmc_hostname(host));
+	return true;
+}
+
+/* mmc_start_host(): no prescan power-up of a removable host while held. */
+bool mmc_sd_hold_prescan(struct mmc_host *host)
+{
+	return held_removable(host);
+}
 
 /*
  * Called by mmc_rescan() for a host without a card, once the card detect state

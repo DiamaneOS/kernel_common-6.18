@@ -1448,6 +1448,8 @@ void _mmc_detect_change(struct mmc_host *host, unsigned long delay, bool cd_irq)
 	 */
 	if (cd_irq && !(host->caps & MMC_CAP_NEEDS_POLL))
 		__pm_wakeup_event(host->ws, 5000);
+	if (cd_irq)
+		mmc_sd_hold_cd_event(host); /* DiamaneOS: sd_hold.c */
 
 	host->detect_change = 1;
 	mmc_schedule_delayed_work(&host->detect, delay);
@@ -2346,7 +2348,8 @@ void mmc_rescan(struct work_struct *work)
 void mmc_start_host(struct mmc_host *host)
 {
 	bool power_up = !(host->caps2 &
-			 (MMC_CAP2_NO_PRESCAN_POWERUP | MMC_CAP2_SD_UHS2));
+			 (MMC_CAP2_NO_PRESCAN_POWERUP | MMC_CAP2_SD_UHS2)) &&
+			!mmc_sd_hold_prescan(host); /* DiamaneOS: sd_hold.c */
 
 	host->f_init = max(min(freqs[0], host->f_max), host->f_min);
 	host->rescan_disable = 0;
