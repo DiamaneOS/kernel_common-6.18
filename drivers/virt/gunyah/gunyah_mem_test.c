@@ -428,6 +428,7 @@ static void test_pool_bind(struct kunit *test, struct gunyah_vm *ghvm, phys_addr
 	KUNIT_ASSERT_NOT_NULL(test, mem);
 	mem->nr_blocks = 2;
 	mem->size = 2 * TEST_BLOCK;
+	mem->shift = GUNYAH_VM_POOL_SHIFT;
 	mutex_init(&mem->lock);
 	for (i = 0; i < 2; i++) {
 		mem->block[i] = gen_pool_alloc(gunyah_vm_pool->blocks, TEST_BLOCK);
@@ -1162,6 +1163,108 @@ static void pool_keeps_room_for_the_decode_vm(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, gunyah_vm_pool_reserved(pool, SZ_128M), 0);
 }
 
+/* An ordinary-memory file of @size with blocks of order @top at most, its pieces in @pieces. */
+static struct gunyah_vm_pool_mem *test_ordinary(struct kunit *test, u64 size, int top, size_t *pieces)
+{
+	struct gunyah_vm_pool_mem *mem;
+	unsigned int got;
+	unsigned long i;
+	u64 *word;
+
+	mem = kvzalloc(struct_size(mem, block, size >> PAGE_SHIFT), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, mem);
+	mem->nr_blocks = size >> PAGE_SHIFT;
+	mem->size = size;
+	mem->ordinary = true;
+	mem->shift = PAGE_SHIFT;
+	mutex_init(&mem->lock);
+	gunyah_vm_ordinary_top = top;
+	KUNIT_ASSERT_EQ(test, 0, gunyah_vm_ordinary_alloc(mem, &got));
+	gunyah_vm_ordinary_top = -1;
+	KUNIT_EXPECT_LE(test, got, (unsigned int)(top >= 0 ? top : MAX_PAGE_ORDER));
+	for (i = 0; i < mem->nr_blocks; i++) {
+		/* Every page zeroed, page aligned, none twice (they are in order within a block). */
+		word = phys_to_virt(mem->block[i]);
+		KUNIT_EXPECT_EQ(test, word[0] | word[PAGE_SIZE / sizeof(*word) - 1], 0);
+		KUNIT_EXPECT_TRUE(test, PAGE_ALIGNED(mem->block[i]));
+		if (i)
+			KUNIT_EXPECT_NE(test, mem->block[i], mem->block[i - 1]);
+	}
+	*pieces = gunyah_vm_pool_pieces(mem);
+	return mem;
+}
+
+/* Ordinary memory for a VM in the largest blocks the page allocator has: few pieces, pages back after release. */
+static void ordinary_memory_in_large_blocks(struct kunit *test)
+{
+	struct gunyah_vm_pool_mem *mem;
+	unsigned long before;
+	size_t pieces;
+
+	/* Pages on the per-CPU lists are not counted free: drained before each count. */
+	drain_all_pages(NULL);
+	before = global_zone_page_state(NR_FREE_PAGES);
+	mem = test_ordinary(test, SZ_8M, -1, &pieces);
+	/* At most 4 MiB blocks: 8 MiB in a few pieces where single pages would be 2048. */
+	KUNIT_EXPECT_LE(test, pieces, 16);
+	gunyah_vm_ordinary_free(mem, mem->nr_blocks);
+	kvfree(mem);
+	drain_all_pages(NULL);
+	KUNIT_EXPECT_GE(test, global_zone_page_state(NR_FREE_PAGES) + SZ_1M / PAGE_SIZE, before);
+}
+
+/* A lower top order (an allocator without large blocks) still fills the file, in blocks of that order. */
+static void ordinary_memory_falls_back_to_smaller_blocks(struct kunit *test)
+{
+	struct gunyah_vm_pool_mem *mem;
+	size_t pieces;
+	unsigned long i;
+
+	mem = test_ordinary(test, SZ_1M, 2, &pieces);
+	KUNIT_EXPECT_EQ(test, mem->nr_blocks, SZ_1M / PAGE_SIZE);
+	/* Blocks of 4 pages: each starts a run on a 16 KiB boundary at least. */
+	for (i = 0; i < mem->nr_blocks; i += 4)
+		KUNIT_EXPECT_TRUE(test, IS_ALIGNED(mem->block[i], 4 * PAGE_SIZE));
+	KUNIT_EXPECT_LE(test, pieces, mem->nr_blocks / 4);
+	gunyah_vm_ordinary_free(mem, mem->nr_blocks);
+	kvfree(mem);
+	mem = test_ordinary(test, 3 * PAGE_SIZE, 0, &pieces);
+	KUNIT_EXPECT_EQ(test, mem->nr_blocks, 3);
+	gunyah_vm_ordinary_free(mem, mem->nr_blocks);
+	kvfree(mem);
+}
+
+/* At most one direct compaction per file, only for a pageblock order or more that was not had. */
+static void ordinary_memory_compacts_at_most_once(struct kunit *test)
+{
+	struct gunyah_vm_pool_mem *mem;
+	unsigned int before = gunyah_vm_ordinary_compactions;
+	size_t pieces;
+
+	mem = test_ordinary(test, SZ_4M, -1, &pieces);
+	KUNIT_EXPECT_LE(test, gunyah_vm_ordinary_compactions - before, 1);
+	gunyah_vm_ordinary_free(mem, mem->nr_blocks);
+	kvfree(mem);
+	before = gunyah_vm_ordinary_compactions;
+	mem = test_ordinary(test, SZ_1M, (int)pageblock_order - 1, &pieces);
+	KUNIT_EXPECT_EQ(test, gunyah_vm_ordinary_compactions, before);
+	gunyah_vm_ordinary_free(mem, mem->nr_blocks);
+	kvfree(mem);
+}
+
+/* The budget of all VMs decides with the file's real pieces. */
+static void ordinary_memory_pieces_fit_the_budget(struct kunit *test)
+{
+	u32 max = gunyah_vm_pieces_max, held = gunyah_vm_pieces;
+
+	gunyah_vm_pieces_max = 100;
+	gunyah_vm_pieces = 90;
+	KUNIT_EXPECT_TRUE(test, gunyah_vm_pieces_fit(10));
+	KUNIT_EXPECT_FALSE(test, gunyah_vm_pieces_fit(11));
+	gunyah_vm_pieces_max = max;
+	gunyah_vm_pieces = held;
+}
+
 static struct kunit_case gunyah_mem_test_cases[] = {
 	KUNIT_CASE(startup_error_state_lifetime),
 	KUNIT_CASE(qtvm_cma_quarantine_keeps_file),
@@ -1185,6 +1288,10 @@ static struct kunit_case gunyah_mem_test_cases[] = {
 	KUNIT_CASE(pool_reclaim_platform_failure),
 	KUNIT_CASE(pool_repeated_teardown),
 	KUNIT_CASE(pool_keeps_room_for_the_decode_vm),
+	KUNIT_CASE(ordinary_memory_in_large_blocks),
+	KUNIT_CASE(ordinary_memory_falls_back_to_smaller_blocks),
+	KUNIT_CASE(ordinary_memory_compacts_at_most_once),
+	KUNIT_CASE(ordinary_memory_pieces_fit_the_budget),
 	KUNIT_CASE(gup_lost_lend_reply),
 	KUNIT_CASE(gup_refused_lend),
 	KUNIT_CASE(gup_repeated_teardown),

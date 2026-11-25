@@ -34,6 +34,13 @@
  * in /sys/class/misc/gunyah_vm_pool/. Ordinary memory in the same state stays
  * pinned for good and is counted in ordinary_lost_bytes there.
  *
+ * With GUNYAH_VM_POOL_MEM_ORDINARY the same kind of file holds ordinary memory
+ * instead, for a VM the pool has no room for: taken from the page allocator in
+ * the largest blocks it has, the largest order that fits first and smaller ones
+ * after (one light compaction at most), so the VM still comes in few pieces. Its
+ * pieces are counted once it is made, and a file whose pieces would take all
+ * VMs past vm_pieces_max is refused with ENOSPC.
+ *
  * The decode service's VM is the one VM of GUNYAH_VM_POOL_MAX_FILE. While no
  * file of that size is held (that VM restarts, or has not started yet), a
  * smaller file is refused when it would leave less than that free, so the
@@ -209,6 +216,10 @@ struct gunyah_vm_pool_mem {
 	bool lost;
 	/* A file of GUNYAH_VM_POOL_MAX_FILE, counted in the pool's largest. */
 	bool largest;
+	/* Ordinary memory from the page allocator, not the pool. */
+	bool ordinary;
+	/* The size of one entry of block[]: GUNYAH_VM_POOL_SHIFT, or PAGE_SHIFT for ordinary memory. */
+	unsigned int shift;
 	unsigned long nr_blocks;
 	phys_addr_t block[] __counted_by(nr_blocks);
 };
@@ -226,7 +237,7 @@ static size_t gunyah_vm_pool_pieces(struct gunyah_vm_pool_mem *mem)
 	unsigned long i;
 
 	for (i = 1; i < mem->nr_blocks; i++)
-		if (mem->block[i] != mem->block[i - 1] + GUNYAH_VM_POOL_BLOCK)
+		if (mem->block[i] != mem->block[i - 1] + BIT_ULL(mem->shift))
 			n++;
 	return n;
 }
@@ -238,7 +249,8 @@ static int gunyah_vm_pool_mem_mmap(struct file *file, struct vm_area_struct *vma
 	unsigned long num, i;
 	struct page **pages;
 	struct page *first;
-	u64 off, in, chunk;
+	u64 off, in, chunk, unit = BIT_ULL(mem->shift);
+	phys_addr_t pa;
 	int ret = 0;
 
 	/* crosvm maps guest memory shared. A private mapping would copy pages on write. */
@@ -257,9 +269,14 @@ static int gunyah_vm_pool_mem_mmap(struct file *file, struct vm_area_struct *vma
 	/* Not VM_IO: crosvm marks guest memory MADV_DONTFORK, which an I/O mapping refuses. */
 	vm_flags_set(vma, VM_DONTEXPAND | VM_DONTDUMP);
 	while (len) {
-		in = off & (GUNYAH_VM_POOL_BLOCK - 1);
-		chunk = min_t(u64, len, GUNYAH_VM_POOL_BLOCK - in);
-		first = pfn_to_page(PHYS_PFN(mem->block[off >> GUNYAH_VM_POOL_SHIFT] + in));
+		in = off & (unit - 1);
+		pa = mem->block[off >> mem->shift] + in;
+		chunk = min_t(u64, len, unit - in);
+		/* Physically adjacent entries go in one call, up to a block. */
+		while (chunk < len && chunk + unit <= GUNYAH_VM_POOL_BLOCK &&
+		       mem->block[(off + chunk) >> mem->shift] == pa + chunk)
+			chunk += min_t(u64, unit, len - chunk);
+		first = pfn_to_page(PHYS_PFN(pa));
 		num = chunk >> PAGE_SHIFT;
 		for (i = 0; i < num; i++)
 			pages[i] = first + i;
@@ -275,13 +292,26 @@ static int gunyah_vm_pool_mem_mmap(struct file *file, struct vm_area_struct *vma
 	return ret;
 }
 
+static void gunyah_vm_ordinary_free(struct gunyah_vm_pool_mem *mem, unsigned long n);
+
 static int gunyah_vm_pool_mem_release(struct inode *inode, struct file *file)
 {
 	struct gunyah_vm_pool_mem *mem = file->private_data;
 	struct gunyah_vm_pool *pool = gunyah_vm_pool;
-	u64 bytes = (u64)mem->nr_blocks * GUNYAH_VM_POOL_BLOCK;
+	u64 bytes = (u64)mem->nr_blocks << mem->shift;
 	unsigned long i;
 
+	if (mem->ordinary) {
+		if (mem->lent || mem->lost) {
+			gunyah_vm_ordinary_lost(bytes);
+			pr_err("%llu MiB of ordinary memory the hypervisor may still hold stay out of use for good\n",
+			       bytes >> 20);
+		} else {
+			gunyah_vm_ordinary_free(mem, mem->nr_blocks);
+		}
+		kvfree(mem);
+		return 0;
+	}
 	if (mem->largest) {
 		mutex_lock(&pool->lock);
 		pool->largest--;
@@ -325,19 +355,159 @@ static u64 gunyah_vm_pool_reserved(struct gunyah_vm_pool *pool, u64 size)
 	return GUNYAH_VM_POOL_MAX_FILE;
 }
 
+/* Tests: the highest order tried (-1 for MAX_PAGE_ORDER), and the direct compactions asked so far. */
+static int gunyah_vm_ordinary_top = -1;
+static unsigned int gunyah_vm_ordinary_compactions;
+
+/* Zeroes and frees the first @n pages of an ordinary file: no VM's data stays behind. */
+static void gunyah_vm_ordinary_free(struct gunyah_vm_pool_mem *mem, unsigned long n)
+{
+	unsigned long i;
+	struct page *page;
+
+	for (i = 0; i < n; i++) {
+		page = pfn_to_page(PHYS_PFN(mem->block[i]));
+		clear_highpage(page);
+		__free_page(page);
+		if (!(i & (GUNYAH_VM_POOL_BLOCK_PAGES - 1)))
+			cond_resched();
+	}
+}
+
+/*
+ * Fills @mem (nr_blocks pages) from the page allocator in the largest blocks it
+ * has: the largest order that fits what is still needed, one order lower each
+ * time an order is not had, never higher again. Orders above 0 are asked without
+ * direct reclaim. The first time an order of a pageblock or more is not had, it is
+ * asked once more with a light direct compaction, once per file. Each block is
+ * split into its pages, which the file records. All or nothing.
+ */
+static int gunyah_vm_ordinary_alloc(struct gunyah_vm_pool_mem *mem, unsigned int *top)
+{
+	unsigned int order = gunyah_vm_ordinary_top >= 0 ? gunyah_vm_ordinary_top : MAX_PAGE_ORDER;
+	const gfp_t fast = (GFP_HIGHUSER | __GFP_ZERO | __GFP_NOWARN) & ~__GFP_DIRECT_RECLAIM;
+	unsigned long done = 0, i;
+	bool compacted = false;
+	struct page *page;
+
+	*top = 0;
+	while (done < mem->nr_blocks) {
+		order = min_t(unsigned int, order, ilog2(mem->nr_blocks - done));
+		page = alloc_pages(order ? fast : GFP_HIGHUSER | __GFP_ZERO, order);
+		if (!page && order >= pageblock_order && !compacted) {
+			compacted = true;
+			gunyah_vm_ordinary_compactions++;
+			page = alloc_pages(GFP_HIGHUSER | __GFP_ZERO | __GFP_NOWARN | __GFP_NORETRY, order);
+		}
+		if (!page) {
+			if (!order) {
+				gunyah_vm_ordinary_free(mem, done);
+				return -ENOMEM;
+			}
+			order--;
+			continue;
+		}
+		*top = max(*top, order);
+		split_page(page, order);
+		for (i = 0; i < BIT(order); i++)
+			mem->block[done + i] = page_to_phys(page + i);
+		done += BIT(order);
+		cond_resched();
+	}
+	return 0;
+}
+
+/* Whether a file of @pieces more fits the budget of all VMs now. */
+static bool gunyah_vm_pieces_fit(size_t pieces)
+{
+	bool fit;
+
+	spin_lock(&gunyah_vm_pieces_lock);
+	fit = (u64)gunyah_vm_pieces + pieces <= gunyah_vm_pieces_max;
+	spin_unlock(&gunyah_vm_pieces_lock);
+	return fit;
+}
+
+/* The file of @mem (filled) as a new descriptor, or a negative error with @mem left to the caller. */
+static int gunyah_vm_pool_mem_install(struct gunyah_vm_pool_mem *mem)
+{
+	struct inode *inode;
+	struct file *file;
+	int fd;
+
+	fd = get_unused_fd_flags(O_CLOEXEC);
+	if (fd < 0)
+		return fd;
+	file = anon_inode_create_getfile("[gunyah-vm-pool]", &gunyah_vm_pool_mem_fops,
+					 mem, O_RDWR, NULL);
+	if (IS_ERR(file)) {
+		put_unused_fd(fd);
+		return PTR_ERR(file);
+	}
+	inode = file_inode(file);
+	inode->i_mode |= S_IFREG;
+	i_size_write(inode, mem->size);
+	file->f_flags |= O_LARGEFILE;
+	fd_install(fd, file);
+	return fd;
+}
+
+/* A file of ordinary memory in large blocks, for a VM the pool has no room for. */
+static long gunyah_vm_ordinary_create_mem_fd(u64 size)
+{
+	struct gunyah_vm_pool_mem *mem;
+	unsigned int top;
+	size_t pieces;
+	int fd, ret;
+
+	mem = kvzalloc(struct_size(mem, block, size >> PAGE_SHIFT), GFP_KERNEL_ACCOUNT);
+	if (!mem)
+		return -ENOMEM;
+	mem->nr_blocks = size >> PAGE_SHIFT;
+	mem->size = size;
+	mem->ordinary = true;
+	mem->shift = PAGE_SHIFT;
+	mutex_init(&mem->lock);
+
+	ret = gunyah_vm_ordinary_alloc(mem, &top);
+	if (ret) {
+		pr_info("no ordinary memory for %llu MiB\n", size >> 20);
+		kvfree(mem);
+		return ret;
+	}
+	pieces = gunyah_vm_pool_pieces(mem);
+	if (!gunyah_vm_pieces_fit(pieces)) {
+		pr_info("%llu MiB of ordinary memory in %zu pieces would pass the %u pieces of all VMs (%u held): refused\n",
+			size >> 20, pieces, gunyah_vm_pieces_max, gunyah_vm_pieces_all());
+		ret = -ENOSPC;
+		goto free;
+	}
+	fd = gunyah_vm_pool_mem_install(mem);
+	if (fd < 0) {
+		ret = fd;
+		goto free;
+	}
+	pr_info("%llu MiB for a VM from ordinary memory in %zu pieces, blocks of order %u at most, %u compactions asked\n",
+		size >> 20, pieces, top, gunyah_vm_ordinary_compactions);
+	return fd;
+
+free:
+	gunyah_vm_ordinary_free(mem, mem->nr_blocks);
+	kvfree(mem);
+	return ret;
+}
+
 static long gunyah_vm_pool_create_mem_fd(struct gunyah_vm_pool_client *client, void __user *argp)
 {
 	struct gunyah_vm_pool *pool = client->pool;
 	struct gunyah_vm_pool_mem_args args;
 	struct gunyah_vm_pool_mem *mem;
 	unsigned long n, i;
-	struct inode *inode;
-	struct file *file;
 	int fd, ret;
 
 	if (copy_from_user(&args, argp, sizeof(args)))
 		return -EFAULT;
-	if (args.flags || !args.size || !PAGE_ALIGNED(args.size))
+	if ((args.flags & ~GUNYAH_VM_POOL_MEM_ORDINARY) || !args.size || !PAGE_ALIGNED(args.size))
 		return -EINVAL;
 	if (args.size > GUNYAH_VM_POOL_MAX_FILE)
 		return -EFBIG;
@@ -348,6 +518,8 @@ static long gunyah_vm_pool_create_mem_fd(struct gunyah_vm_pool_client *client, v
 	mutex_unlock(&pool->lock);
 	if (ret)
 		return ret;
+	if (args.flags & GUNYAH_VM_POOL_MEM_ORDINARY)
+		return gunyah_vm_ordinary_create_mem_fd(args.size);
 
 	n = DIV_ROUND_UP(args.size, GUNYAH_VM_POOL_BLOCK);
 	mem = kvzalloc(struct_size(mem, block, n), GFP_KERNEL_ACCOUNT);
@@ -355,6 +527,7 @@ static long gunyah_vm_pool_create_mem_fd(struct gunyah_vm_pool_client *client, v
 		return -ENOMEM;
 	mem->nr_blocks = n;
 	mem->size = args.size;
+	mem->shift = GUNYAH_VM_POOL_SHIFT;
 	mutex_init(&mem->lock);
 
 	/* All or nothing, in arrival order. */
@@ -391,30 +564,15 @@ static long gunyah_vm_pool_create_mem_fd(struct gunyah_vm_pool_client *client, v
 		cond_resched();
 	}
 
-	fd = get_unused_fd_flags(O_CLOEXEC);
+	fd = gunyah_vm_pool_mem_install(mem);
 	if (fd < 0) {
 		ret = fd;
 		goto free_blocks;
 	}
-
-	file = anon_inode_create_getfile("[gunyah-vm-pool]", &gunyah_vm_pool_mem_fops,
-					 mem, O_RDWR, NULL);
-	if (IS_ERR(file)) {
-		ret = PTR_ERR(file);
-		goto put_fd;
-	}
-	inode = file_inode(file);
-	inode->i_mode |= S_IFREG;
-	i_size_write(inode, args.size);
-	file->f_flags |= O_LARGEFILE;
-
 	pr_info("%llu MiB for a VM in %zu pieces, %zu MiB left\n", args.size >> 20,
 		gunyah_vm_pool_pieces(mem), gen_pool_avail(pool->blocks) >> 20);
-	fd_install(fd, file);
 	return fd;
 
-put_fd:
-	put_unused_fd(fd);
 free_blocks:
 	/* Never lent, already zeroed. */
 	mutex_lock(&pool->lock);
@@ -650,16 +808,16 @@ int gunyah_vm_pool_share_parcel(struct gunyah_vm *ghvm, struct gunyah_vm_parcel 
 	if (end > mem->size)
 		return -EINVAL;
 
-	parcel->mem_entries = kvcalloc(DIV_ROUND_UP(end - off, GUNYAH_VM_POOL_BLOCK) + 1,
+	parcel->mem_entries = kvcalloc(DIV_ROUND_UP(end - off, BIT_ULL(mem->shift)) + 1,
 				       sizeof(parcel->mem_entries[0]), GFP_KERNEL_ACCOUNT);
 	if (!parcel->mem_entries)
 		return -ENOMEM;
 
 	/* One entry for each run of physically adjacent blocks. */
 	for (pos = off; pos < end; pos += chunk) {
-		in = pos & (GUNYAH_VM_POOL_BLOCK - 1);
-		chunk = min_t(u64, end - pos, GUNYAH_VM_POOL_BLOCK - in);
-		pa = mem->block[pos >> GUNYAH_VM_POOL_SHIFT] + in;
+		in = pos & (BIT_ULL(mem->shift) - 1);
+		chunk = min_t(u64, end - pos, BIT_ULL(mem->shift) - in);
+		pa = mem->block[pos >> mem->shift] + in;
 		e = n ? &parcel->mem_entries[n - 1] : NULL;
 		if (e && le64_to_cpu(e->phys_addr) + le64_to_cpu(e->size) == pa) {
 			e->size = cpu_to_le64(le64_to_cpu(e->size) + chunk);
@@ -692,8 +850,8 @@ int gunyah_vm_pool_share_parcel(struct gunyah_vm *ghvm, struct gunyah_vm_parcel 
 		dev_err(ghvm->parent, "%s of %llu MiB from the pool ended with %d, the hypervisor %s it: the blocks are quarantined\n",
 			how, gunyah_gfn_to_gpa(*nr) >> 20, ret,
 			owner == GUNYAH_RM_MEM_LENT ? "holds" : "may hold");
-	dev_info(ghvm->parent, "%s gfn %llx from the pool: %llu pages in %zu pieces, %u for the whole VM, %u for all VMs, ret %d\n",
-		 how, *gfn, *nr, n, ghvm->lent_pieces, gunyah_vm_pieces_all(), ret);
+	dev_info(ghvm->parent, "%s gfn %llx from %s: %llu pages in %zu pieces, %u for the whole VM, %u for all VMs, ret %d\n",
+		 how, *gfn, mem->ordinary ? "ordinary blocks" : "the pool", *nr, n, ghvm->lent_pieces, gunyah_vm_pieces_all(), ret);
 	/* A parcel the resource manager holds stays bound, also after a failure, for its reclaim. */
 	if (owner != GUNYAH_RM_MEM_LENT)
 		goto free_mem_entries;
