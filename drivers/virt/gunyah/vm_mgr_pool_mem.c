@@ -34,6 +34,12 @@
  * in /sys/class/misc/gunyah_vm_pool/. Ordinary memory in the same state stays
  * pinned for good and is counted in ordinary_lost_bytes there.
  *
+ * The decode service's VM is the one VM of GUNYAH_VM_POOL_MAX_FILE. While no
+ * file of that size is held (that VM restarts, or has not started yet), a
+ * smaller file is refused when it would leave less than that free, so the
+ * other VMs (cards and OBB images) never take that VM's room. reserved_bytes
+ * shows what is held back now.
+ *
  * The same directory has the piece counts of all VMs together: vm_pieces, the
  * physically separate pieces the hypervisor holds or may hold now in parcels
  * lent or shared to any VM, pool or ordinary memory, and vm_pieces_max, the
@@ -92,6 +98,8 @@ struct gunyah_vm_pool {
 	struct mutex lock;
 	/* Bytes the hypervisor may still hold, out of use until the next boot. */
 	atomic64_t lost;
+	/* Files of GUNYAH_VM_POOL_MAX_FILE held now (the decode service's VM). Under lock. */
+	unsigned int largest;
 };
 
 /* One open of /dev/gunyah_vm_pool. */
@@ -199,6 +207,8 @@ struct gunyah_vm_pool_mem {
 	unsigned int lent;
 	/* The hypervisor may still hold blocks: an outcome was unknown (enum gunyah_rm_mem_owner). */
 	bool lost;
+	/* A file of GUNYAH_VM_POOL_MAX_FILE, counted in the pool's largest. */
+	bool largest;
 	unsigned long nr_blocks;
 	phys_addr_t block[] __counted_by(nr_blocks);
 };
@@ -272,6 +282,11 @@ static int gunyah_vm_pool_mem_release(struct inode *inode, struct file *file)
 	u64 bytes = (u64)mem->nr_blocks * GUNYAH_VM_POOL_BLOCK;
 	unsigned long i;
 
+	if (mem->largest) {
+		mutex_lock(&pool->lock);
+		pool->largest--;
+		mutex_unlock(&pool->lock);
+	}
 	if (mem->lent || mem->lost) {
 		pr_err("%llu MiB the hypervisor may still hold stay out of the pool until the next boot, %lld MiB lost in all\n",
 		       bytes >> 20, atomic64_add_return(bytes, &pool->lost) >> 20);
@@ -296,6 +311,19 @@ static const struct file_operations gunyah_vm_pool_mem_fops = {
 	.release = gunyah_vm_pool_mem_release,
 	.llseek = noop_llseek,
 };
+
+/*
+ * The bytes a file of @size must leave free: GUNYAH_VM_POOL_MAX_FILE while no
+ * file of that size is held and the pool could hold one, else none. Under the
+ * pool's lock.
+ */
+static u64 gunyah_vm_pool_reserved(struct gunyah_vm_pool *pool, u64 size)
+{
+	if (pool->largest || size == GUNYAH_VM_POOL_MAX_FILE ||
+	    (u64)pool->size < GUNYAH_VM_POOL_MAX_FILE + (u64)atomic64_read(&pool->lost))
+		return 0;
+	return GUNYAH_VM_POOL_MAX_FILE;
+}
 
 static long gunyah_vm_pool_create_mem_fd(struct gunyah_vm_pool_client *client, void __user *argp)
 {
@@ -331,9 +359,11 @@ static long gunyah_vm_pool_create_mem_fd(struct gunyah_vm_pool_client *client, v
 
 	/* All or nothing, in arrival order. */
 	mutex_lock(&pool->lock);
-	if ((u64)n * GUNYAH_VM_POOL_BLOCK > gen_pool_avail(pool->blocks)) {
-		pr_info("no room for %llu MiB, %zu MiB free: the VM gets ordinary memory\n",
-			args.size >> 20, gen_pool_avail(pool->blocks) >> 20);
+	if ((u64)n * GUNYAH_VM_POOL_BLOCK + gunyah_vm_pool_reserved(pool, args.size) >
+	    gen_pool_avail(pool->blocks)) {
+		pr_info("no room for %llu MiB, %zu MiB free, %llu MiB of it kept for the decode service's VM: the VM gets ordinary memory\n",
+			args.size >> 20, gen_pool_avail(pool->blocks) >> 20,
+			gunyah_vm_pool_reserved(pool, args.size) >> 20);
 		mutex_unlock(&pool->lock);
 		kvfree(mem);
 		return -ENOMEM;
@@ -348,6 +378,10 @@ static long gunyah_vm_pool_create_mem_fd(struct gunyah_vm_pool_client *client, v
 			kvfree(mem);
 			return -ENOMEM;
 		}
+	}
+	if (args.size == GUNYAH_VM_POOL_MAX_FILE) {
+		mem->largest = true;
+		pool->largest++;
 	}
 	mutex_unlock(&pool->lock);
 
@@ -386,6 +420,8 @@ free_blocks:
 	mutex_lock(&pool->lock);
 	while (i--)
 		gen_pool_free(pool->blocks, mem->block[i], GUNYAH_VM_POOL_BLOCK);
+	if (mem->largest)
+		pool->largest--;
 	mutex_unlock(&pool->lock);
 	kvfree(mem);
 	return ret;
@@ -433,6 +469,17 @@ static ssize_t free_bytes_show(struct device *dev, struct device_attribute *attr
 	return sysfs_emit(buf, "%zu\n", gen_pool_avail(gunyah_vm_pool->blocks));
 }
 static DEVICE_ATTR_RO(free_bytes);
+
+static ssize_t reserved_bytes_show(struct device *dev, struct device_attribute *attr, char *buf)
+{
+	u64 reserved;
+
+	mutex_lock(&gunyah_vm_pool->lock);
+	reserved = gunyah_vm_pool_reserved(gunyah_vm_pool, 0);
+	mutex_unlock(&gunyah_vm_pool->lock);
+	return sysfs_emit(buf, "%llu\n", reserved);
+}
+static DEVICE_ATTR_RO(reserved_bytes);
 
 static ssize_t lost_bytes_show(struct device *dev, struct device_attribute *attr, char *buf)
 {
@@ -485,6 +532,7 @@ static DEVICE_ATTR_RW(vm_pieces_max);
 static struct attribute *gunyah_vm_pool_attrs[] = {
 	&dev_attr_size_bytes.attr,
 	&dev_attr_free_bytes.attr,
+	&dev_attr_reserved_bytes.attr,
 	&dev_attr_lost_bytes.attr,
 	&dev_attr_ordinary_lost_bytes.attr,
 	&dev_attr_vm_pieces.attr,

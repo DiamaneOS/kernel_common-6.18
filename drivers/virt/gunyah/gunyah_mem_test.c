@@ -1138,6 +1138,30 @@ static void startup_error_state_lifetime(struct kunit *test)
 	KUNIT_EXPECT_TRUE(test, xa_empty(&gunyah_vm_start_states));
 }
 
+/*
+ * The decode service's VM keeps its room: while no file of its size is held, a
+ * smaller file must leave that much free. With it held, or for a file of its
+ * size, nothing is kept back, nor when lost blocks make room for it impossible.
+ */
+static void pool_keeps_room_for_the_decode_vm(struct kunit *test)
+{
+	struct gunyah_vm_pool *pool = kunit_kzalloc(test, sizeof(*pool), GFP_KERNEL);
+
+	KUNIT_ASSERT_NOT_NULL(test, pool);
+	pool->size = SZ_512M;
+	atomic64_set(&pool->lost, 0);
+	KUNIT_EXPECT_EQ(test, gunyah_vm_pool_reserved(pool, SZ_128M), GUNYAH_VM_POOL_MAX_FILE);
+	KUNIT_EXPECT_EQ(test, gunyah_vm_pool_reserved(pool, GUNYAH_VM_POOL_MAX_FILE), 0);
+	pool->largest = 1;
+	KUNIT_EXPECT_EQ(test, gunyah_vm_pool_reserved(pool, SZ_128M), 0);
+	pool->largest = 0;
+	atomic64_set(&pool->lost, SZ_256M);
+	KUNIT_EXPECT_EQ(test, gunyah_vm_pool_reserved(pool, SZ_128M), 0);
+	pool->size = SZ_256M;
+	atomic64_set(&pool->lost, 0);
+	KUNIT_EXPECT_EQ(test, gunyah_vm_pool_reserved(pool, SZ_128M), 0);
+}
+
 static struct kunit_case gunyah_mem_test_cases[] = {
 	KUNIT_CASE(startup_error_state_lifetime),
 	KUNIT_CASE(qtvm_cma_quarantine_keeps_file),
@@ -1160,6 +1184,7 @@ static struct kunit_case gunyah_mem_test_cases[] = {
 	KUNIT_CASE(pool_lost_lend_reply),
 	KUNIT_CASE(pool_reclaim_platform_failure),
 	KUNIT_CASE(pool_repeated_teardown),
+	KUNIT_CASE(pool_keeps_room_for_the_decode_vm),
 	KUNIT_CASE(gup_lost_lend_reply),
 	KUNIT_CASE(gup_refused_lend),
 	KUNIT_CASE(gup_repeated_teardown),
