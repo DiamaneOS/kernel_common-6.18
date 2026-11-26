@@ -379,13 +379,16 @@ static void gunyah_vm_ordinary_free(struct gunyah_vm_pool_mem *mem, unsigned lon
  * has: the largest order that fits what is still needed, one order lower each
  * time an order is not had, never higher again. Orders above 0 are asked without
  * direct reclaim. The first time an order of a pageblock or more is not had, it is
- * asked once more with a light direct compaction, once per file. Each block is
- * split into its pages, which the file records. All or nothing.
+ * asked once more with a light direct compaction, once per file. Order 0 may
+ * reclaim but fails rather than wake the OOM killer (-ENOMEM: the caller's start
+ * fails or waits, nothing is killed for it). Each block is split into its pages,
+ * which the file records. All or nothing.
  */
 static int gunyah_vm_ordinary_alloc(struct gunyah_vm_pool_mem *mem, unsigned int *top)
 {
 	unsigned int order = gunyah_vm_ordinary_top >= 0 ? gunyah_vm_ordinary_top : MAX_PAGE_ORDER;
 	const gfp_t fast = (GFP_HIGHUSER | __GFP_ZERO | __GFP_NOWARN) & ~__GFP_DIRECT_RECLAIM;
+	const gfp_t last = GFP_HIGHUSER | __GFP_ZERO | __GFP_NOWARN | __GFP_RETRY_MAYFAIL;
 	unsigned long done = 0, i;
 	bool compacted = false;
 	struct page *page;
@@ -393,7 +396,7 @@ static int gunyah_vm_ordinary_alloc(struct gunyah_vm_pool_mem *mem, unsigned int
 	*top = 0;
 	while (done < mem->nr_blocks) {
 		order = min_t(unsigned int, order, ilog2(mem->nr_blocks - done));
-		page = alloc_pages(order ? fast : GFP_HIGHUSER | __GFP_ZERO, order);
+		page = alloc_pages(order ? fast : last, order);
 		if (!page && order >= pageblock_order && !compacted) {
 			compacted = true;
 			gunyah_vm_ordinary_compactions++;
