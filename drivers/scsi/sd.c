@@ -3909,6 +3909,17 @@ static int sd_format_disk_name(char *prefix, int index, char *buf, int buflen)
 	return 0;
 }
 
+/* DiamaneOS: true for a disk behind USB (usb-storage, its subdrivers, uas). */
+static bool sd_behind_usb(struct scsi_device *sdp)
+{
+	struct device *dev;
+
+	for (dev = sdp->sdev_gendev.parent; dev; dev = dev->parent)
+		if (dev->bus && !strcmp(dev->bus->name, "usb"))
+			return true;
+	return false;
+}
+
 /**
  *	sd_probe - called during driver initialization and whenever a
  *	new scsi device is attached to the system. It is called once
@@ -4029,6 +4040,10 @@ static int sd_probe(struct device *dev)
 		gd->events |= DISK_EVENT_MEDIA_CHANGE;
 		gd->event_flags = DISK_EVENT_FLAG_POLL | DISK_EVENT_FLAG_UEVENT;
 	}
+	/* DiamaneOS: userspace reads the table of a disk behind USB */
+	if (IS_ENABLED(CONFIG_BLK_NO_EXTERNAL_PART_SCAN) &&
+	    sd_behind_usb(sdp))
+		gd->flags |= GENHD_FL_USER_PART;
 
 	blk_pm_runtime_init(sdp->request_queue, dev);
 	if (sdp->rpm_autosuspend) {

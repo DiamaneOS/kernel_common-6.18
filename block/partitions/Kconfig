@@ -4,6 +4,27 @@
 #
 menu "Partition Types"
 
+# DiamaneOS: the filesystem VM reads these tables instead (vold fs/Fsvm.cpp).
+config BLK_NO_EXTERNAL_PART_SCAN
+	bool "Do not read partition tables of SD cards and USB disks"
+	depends on BLK_DEV_SD != m && MMC_BLOCK != m
+	help
+	  The kernel reads the partition table of a disk as soon as it
+	  appears, before userspace decides whether to use it. With this
+	  option it does not do so for cards in removable MMC and SD slots
+	  and for disks behind USB, and refuses requests to rescan them.
+	  Userspace gets the whole disk and can parse the table in an
+	  isolated process or VM, and serve its partitions itself (for
+	  example as device-mapper ranges): BLKPG cannot add partitions to
+	  such a disk. Loop devices have no partitions at all: their
+	  partition table is never read (LO_FLAGS_PARTSCAN is refused and
+	  loop.max_part is ignored) and BLKPG adds none. Internal storage
+	  keeps its partitions. This boundary is fixed at build time and has no
+	  command-line, bootconfig or module parameter override. A userspace
+	  that needs the kernel to read external tables must disable this option.
+
+	  If unsure, say N.
+
 config PARTITION_ADVANCED
 	bool "Advanced partition selection"
 	help
