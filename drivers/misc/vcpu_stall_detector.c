@@ -17,6 +17,7 @@
 #include <linux/percpu.h>
 #include <linux/platform_device.h>
 #include <linux/slab.h>
+#include <linux/timer.h>
 
 #define VCPU_STALL_REG_STATUS		(0x00)
 #define VCPU_STALL_REG_LOAD_CNT		(0x04)
@@ -40,7 +41,11 @@ struct vcpu_stall_detect_config {
 };
 
 struct vcpu_stall_priv {
-	struct hrtimer vcpu_hrtimer;
+	/*
+	 * DiamaneOS: a deferrable timer, pinned to its CPU: an idle vCPU is not
+	 * woken to pet the detector, whose counter only runs while the vCPU runs.
+	 */
+	struct timer_list vcpu_timer;
 	bool is_initialized;
 };
 
@@ -55,8 +60,7 @@ static struct vcpu_stall_detect_config vcpu_stall_config;
 
 static struct vcpu_stall_priv __percpu *vcpu_stall_detectors;
 
-static enum hrtimer_restart
-vcpu_stall_detect_timer_fn(struct hrtimer *hrtimer)
+static void vcpu_stall_detect_timer_fn(struct timer_list *timer)
 {
 	u32 ticks, ping_timeout_ms;
 
@@ -72,10 +76,7 @@ vcpu_stall_detect_timer_fn(struct hrtimer *hrtimer)
 
 	ping_timeout_ms = vcpu_stall_config.stall_timeout_sec *
 			  MSEC_PER_SEC / 2;
-	hrtimer_forward_now(hrtimer,
-			    ms_to_ktime(ping_timeout_ms));
-
-	return HRTIMER_RESTART;
+	mod_timer(timer, jiffies + msecs_to_jiffies(ping_timeout_ms));
 }
 
 static irqreturn_t vcpu_stall_detector_irq(int irq, void *dev)
@@ -89,7 +90,7 @@ static int start_stall_detector_cpu(unsigned int cpu)
 	u32 ticks, ping_timeout_ms;
 	struct vcpu_stall_priv *vcpu_stall_detector =
 		this_cpu_ptr(vcpu_stall_detectors);
-	struct hrtimer *vcpu_hrtimer = &vcpu_stall_detector->vcpu_hrtimer;
+	struct timer_list *vcpu_timer = &vcpu_stall_detector->vcpu_timer;
 
 	vcpu_stall_reg_write(cpu, VCPU_STALL_REG_CLOCK_FREQ_HZ,
 			     vcpu_stall_config.clock_freq_hz);
@@ -111,11 +112,11 @@ static int start_stall_detector_cpu(unsigned int cpu)
 	ping_timeout_ms = vcpu_stall_config.stall_timeout_sec *
 			  MSEC_PER_SEC / 2;
 
-	hrtimer_setup(vcpu_hrtimer, vcpu_stall_detect_timer_fn, CLOCK_MONOTONIC, HRTIMER_MODE_REL);
+	timer_setup(vcpu_timer, vcpu_stall_detect_timer_fn,
+		    TIMER_DEFERRABLE | TIMER_PINNED);
 	vcpu_stall_detector->is_initialized = true;
 
-	hrtimer_start(vcpu_hrtimer, ms_to_ktime(ping_timeout_ms),
-		      HRTIMER_MODE_REL_PINNED);
+	mod_timer(vcpu_timer, jiffies + msecs_to_jiffies(ping_timeout_ms));
 
 	return 0;
 }
@@ -129,7 +130,7 @@ static int stop_stall_detector_cpu(unsigned int cpu)
 		return 0;
 
 	/* Disable the stall detector for the current CPU */
-	hrtimer_cancel(&vcpu_stall_detector->vcpu_hrtimer);
+	timer_delete_sync(&vcpu_stall_detector->vcpu_timer);
 	vcpu_stall_reg_write(cpu, VCPU_STALL_REG_STATUS, 0);
 	vcpu_stall_detector->is_initialized = false;
 
