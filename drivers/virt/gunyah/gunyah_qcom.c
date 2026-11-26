@@ -8,6 +8,7 @@
 #include <linux/mm.h>
 #include <linux/module.h>
 #include <linux/firmware/qcom/qcom_scm.h>
+#include <linux/firmware/qcom/diamaneos_scm_mem.h> /* DiamaneOS: assignment outcomes */
 #include <linux/types.h>
 #include <linux/uuid.h>
 
@@ -57,6 +58,9 @@ qcom_scm_gunyah_rm_pre_mem_share(struct gunyah_rm *rm,
 	/* Did it work ok? */
 	if (!ret)
 		return 0;
+	/* DiamaneOS: rollback cannot establish the failed run's ownership. */
+	if (qcom_scm_assign_is_unknown(ret))
+		ret = -ENOTRECOVERABLE;
 
 	src = 0;
 	for (n = 0; n < mem_parcel->n_acl_entries; n++) {
@@ -73,10 +77,15 @@ qcom_scm_gunyah_rm_pre_mem_share(struct gunyah_rm *rm,
 
 	for (i--; i >= 0; i--) {
 		src_cpy = src;
-		WARN_ON_ONCE(qcom_scm_assign_mem(
+		/*
+		 * DiamaneOS: a run that does not come back leaves the parcel's
+		 * owner unknown (struct gunyah_rm_platform_ops).
+		 */
+		if (WARN_ON_ONCE(qcom_scm_assign_mem(
 			le64_to_cpu(mem_parcel->mem_entries[i].phys_addr),
 			le64_to_cpu(mem_parcel->mem_entries[i].size), &src_cpy,
-			new_perms, 1));
+			new_perms, 1)))
+			ret = -ENOTRECOVERABLE;
 	}
 
 	return ret;
@@ -88,7 +97,7 @@ qcom_scm_gunyah_rm_post_mem_reclaim(struct gunyah_rm *rm,
 {
 	struct qcom_scm_vmperm new_perms;
 	u64 src = 0, src_cpy;
-	int ret = 0, i, n;
+	int ret = 0, err, i, n;
 	u16 vmid;
 
 	new_perms.vmid = QCOM_SCM_VMID_HLOS;
@@ -105,11 +114,14 @@ qcom_scm_gunyah_rm_post_mem_reclaim(struct gunyah_rm *rm,
 
 	for (i = 0; i < mem_parcel->n_mem_entries; i++) {
 		src_cpy = src;
-		ret = qcom_scm_assign_mem(
+		err = qcom_scm_assign_mem(
 			le64_to_cpu(mem_parcel->mem_entries[i].phys_addr),
 			le64_to_cpu(mem_parcel->mem_entries[i].size), &src_cpy,
 			&new_perms, 1);
-		WARN_ON_ONCE(ret);
+		WARN_ON_ONCE(err);
+		/* DiamaneOS: every run that can come back does, the first failure is kept */
+		if (err && !ret)
+			ret = err;
 	}
 
 	return ret;

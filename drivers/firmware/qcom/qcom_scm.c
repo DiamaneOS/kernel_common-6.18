@@ -14,6 +14,7 @@
 #include <linux/err.h>
 #include <linux/export.h>
 #include <linux/firmware/qcom/qcom_scm.h>
+#include <linux/firmware/qcom/diamaneos_scm_mem.h> /* DiamaneOS: assignment outcomes */
 #include <linux/firmware/qcom/qcom_tzmem.h>
 #include <linux/init.h>
 #include <linux/interconnect.h>
@@ -1128,7 +1129,7 @@ int qcom_scm_assign_mem(phys_addr_t mem_addr, size_t mem_sz,
 	void *ptr __free(qcom_tzmem) = qcom_tzmem_alloc(__scm->mempool,
 							ptr_sz, GFP_KERNEL);
 	if (!ptr)
-		return -ENOMEM;
+		return QCOM_SCM_ASSIGN_NOT_ISSUED;
 
 	ptr_phys = qcom_tzmem_to_phys(ptr);
 
@@ -1163,7 +1164,7 @@ int qcom_scm_assign_mem(phys_addr_t mem_addr, size_t mem_sz,
 	if (ret) {
 		dev_err(__scm->dev,
 			"Assign memory protection call failed %d\n", ret);
-		return ret;
+		return QCOM_SCM_ASSIGN_UNKNOWN;
 	}
 
 	*srcvm = next_vm;
