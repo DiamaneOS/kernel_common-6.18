@@ -55,6 +55,7 @@
 #include <uapi/linux/sched/types.h>
 
 #include "sched.h"
+#include "diamaneos_fair_idle.h" /* DiamaneOS: guest idle reservations */
 #include "stats.h"
 #include "autogroup.h"
 
@@ -7425,6 +7426,7 @@ static int dequeue_entities(struct rq *rq, struct sched_entity *se, int flags)
 	}
 
 	sub_nr_running(rq, h_nr_queued);
+	diamaneos_fair_idle(rq);
 
 	/* balance early to pull high priority tasks */
 	if (unlikely(!was_sched_idle && sched_idle_rq(rq)))
