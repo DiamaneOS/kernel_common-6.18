@@ -30,6 +30,7 @@
 #include "quirks.h"
 #include "sd.h"
 #include "sd_ops.h"
+#include "sd_hold.h"
 
 static const unsigned int tran_exp[] = {
 	10000,		100000,		1000000,	10000000,
@@ -1731,6 +1732,7 @@ static int _mmc_sd_suspend(struct mmc_host *host)
 	if (!err) {
 		mmc_power_off(host);
 		mmc_card_set_suspended(card);
+		mmc_sd_hold_card_off(host); /* DiamaneOS: sd_hold.c */
 	}
 
 out:
@@ -1779,6 +1781,13 @@ static int _mmc_sd_resume(struct mmc_host *host)
 
 	if (!mmc_card_suspended(host->card))
 		goto out;
+
+	/* DiamaneOS: a card that may have been swapped while off gets no command (sd_hold.c). */
+	if (mmc_sd_hold_card_moved(host)) {
+		mmc_card_set_removed(host->card);
+		err = -ENOMEDIUM;
+		goto out;
+	}
 
 	mmc_power_up(host, host->card->ocr);
 	err = mmc_sd_init_card(host, host->card->ocr, host->card);

@@ -45,6 +45,7 @@
 #include "mmc_ops.h"
 #include "sd_ops.h"
 #include "sdio_ops.h"
+#include "sd_hold.h"
 
 /* The max erase timeout, used when host->max_busy_timeout isn't specified */
 #define MMC_ERASE_TIMEOUT_MS	(60 * 1000) /* 60 s */
@@ -1447,6 +1448,8 @@ void _mmc_detect_change(struct mmc_host *host, unsigned long delay, bool cd_irq)
 	 */
 	if (cd_irq && !(host->caps & MMC_CAP_NEEDS_POLL))
 		__pm_wakeup_event(host->ws, 5000);
+	if (cd_irq)
+		mmc_sd_hold_cd_event(host); /* DiamaneOS: sd_hold.c */
 
 	host->detect_change = 1;
 	mmc_schedule_delayed_work(&host->detect, delay);
@@ -2287,6 +2290,13 @@ void mmc_rescan(struct work_struct *work)
 		goto out;
 	}
 
+	/* DiamaneOS: no command to a new card while it is held (sd_hold.c). */
+	if (mmc_sd_hold_new_card(host)) {
+		mmc_power_off(host);
+		mmc_release_host(host);
+		goto out;
+	}
+
 	/* If an SD express card is present, then leave it as is. */
 	if (mmc_card_sd_express(host)) {
 		mmc_release_host(host);
@@ -2338,7 +2348,8 @@ void mmc_rescan(struct work_struct *work)
 void mmc_start_host(struct mmc_host *host)
 {
 	bool power_up = !(host->caps2 &
-			 (MMC_CAP2_NO_PRESCAN_POWERUP | MMC_CAP2_SD_UHS2));
+			 (MMC_CAP2_NO_PRESCAN_POWERUP | MMC_CAP2_SD_UHS2)) &&
+			!mmc_sd_hold_prescan(host); /* DiamaneOS: sd_hold.c */
 
 	host->f_init = max(min(freqs[0], host->f_max), host->f_min);
 	host->rescan_disable = 0;
@@ -2364,6 +2375,7 @@ void __mmc_stop_host(struct mmc_host *host)
 	}
 
 	host->rescan_disable = 1;
+	mmc_sd_hold_sync(); /* DiamaneOS: sd_hold.c */
 	cancel_delayed_work_sync(&host->detect);
 }
 
