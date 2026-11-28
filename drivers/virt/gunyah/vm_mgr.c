@@ -1053,7 +1053,9 @@ static int gunyah_vm_start(struct gunyah_vm *ghvm)
 		trace_android_rvh_gh_note_fw_parcel(ghvm, ghvm->vmid,
 						    ghvm->fw.parcel.parcel.mem_handle);
 
+	gunyah_heap_diag(ghvm->rm, "before", ghvm->vmid);
 	ret = gunyah_rm_vm_start(ghvm->rm, ghvm->vmid);
+	gunyah_heap_diag(ghvm->rm, ret ? "refused" : "started", ghvm->vmid);
 	if (ret) {
 		dev_warn(ghvm->parent, "Failed to start VM: %d\n", ret);
 		goto err;

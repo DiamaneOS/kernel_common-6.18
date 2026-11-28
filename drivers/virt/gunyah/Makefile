@@ -2,7 +2,7 @@
 
 obj-$(CONFIG_GUNYAH_HYPERCALLS)		+= gunyah.o
 
-gunyah_rsc_mgr-y += rsc_mgr.o rsc_mgr_rpc.o vm_mgr.o vm_mgr_mem.o
+gunyah_rsc_mgr-y += rsc_mgr.o rsc_mgr_rpc.o vm_mgr.o vm_mgr_mem.o vm_mgr_heap_diag.o
 gunyah_rsc_mgr-$(CONFIG_GUNYAH_CMA_MEM) += vm_mgr_cma_mem.o
 # DiamaneOS: the VM memory pool set aside at boot
 gunyah_rsc_mgr-$(CONFIG_GUNYAH_LEND_UPFRONT) += vm_mgr_pool_mem.o

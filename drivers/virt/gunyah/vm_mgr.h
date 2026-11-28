@@ -372,4 +372,6 @@ static inline int gunyah_vm_post_vm_reset(struct gunyah_vm *ghvm)
 
 	return 0;
 }
+void gunyah_heap_diag(struct gunyah_rm *rm, const char *when, u16 vmid);
+
 #endif
